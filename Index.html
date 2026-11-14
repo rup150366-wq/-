@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#191c1c">
+  <meta name="description" content="Бурундук — личные сообщения и звонки.">
+  <title>Бурундук — мессенджер</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-theme="dark">
+  <main class="auth-screen" id="auth-screen">
+    <section class="auth-card" aria-labelledby="auth-title">
+      <div class="auth-brand">
+        <span class="brand-mark" aria-hidden="true">б</span>
+        <span>бурундук</span>
+      </div>
+      <div class="auth-intro">
+        <span class="eyebrow">ВАШЕ ПРОСТРАНСТВО ДЛЯ ОБЩЕНИЯ</span>
+        <h1 id="auth-title">На связи —<br><span>по-настоящему.</span></h1>
+        <p>Личные сообщения и звонки. Без случайных собеседников.</p>
+      </div>
+      <div class="auth-tabs" role="tablist" aria-label="Вход или регистрация">
+        <button class="auth-tab active" id="login-tab" type="button" role="tab" aria-selected="true">Войти</button>
+        <button class="auth-tab" id="register-tab" type="button" role="tab" aria-selected="false">Создать аккаунт</button>
+      </div>
+      <form class="auth-form" id="auth-form">
+        <label id="name-field" class="form-field" hidden>
+          <span>Как к вам обращаться</span>
+          <input id="auth-name" name="name" type="text" maxlength="60" autocomplete="name" placeholder="Ваше имя">
+        </label>
+        <label class="form-field">
+          <span>Никнейм</span>
+          <div class="input-with-prefix"><span>@</span><input id="auth-username" name="username" type="text" minlength="3" maxlength="30" pattern="[A-Za-z0-9_]{3,30}" autocomplete="username" placeholder="username" required></div>
+        </label>
+        <label class="form-field">
+          <span>Пароль</span>
+          <input id="auth-password" name="password" type="password" minlength="8" maxlength="128" autocomplete="current-password" placeholder="Не короче 8 символов" required>
+        </label>
+        <p class="form-error" id="auth-error" role="alert" hidden></p>
+        <button class="primary-button auth-submit" id="auth-submit" type="submit">Войти <span>→</span></button>
+      </form>
+      <p class="auth-note">Нужен аккаунт, чтобы переписываться и звонить другим пользователям.</p>
+      <button class="theme-button auth-theme" id="theme-toggle" type="button"><span class="theme-icon">◐</span><span id="theme-label">Тёмная тема</span></button>
+    </section>
+    <div class="auth-art" aria-hidden="true">
+      <div class="art-orbit orbit-one"></div>
+      <div class="art-orbit orbit-two"></div>
+      <div class="art-squirrel">🐿️</div>
+      <span class="art-caption">Только свои.<br>Только по делу.</span>
+      <span class="art-spark spark-one">✳</span>
+      <span class="art-spark spark-two">✦</span>
+    </div>
+  </main>
+
+  <main class="messenger hidden" id="app-screen">
+    <aside class="sidebar" id="sidebar" aria-label="Мессенджер">
+      <header class="sidebar-top">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">б</span>
+          <span>бурундук</span>
+        </div>
+        <button class="icon-button" id="sidebar-theme-toggle" type="button" aria-label="Сменить тему" title="Сменить тему">◐</button>
+      </header>
+
+      <label class="search">
+        <span aria-hidden="true">⌕</span>
+        <input id="search-input" type="search" placeholder="Поиск по чатам" autocomplete="off">
+        <kbd>Ctrl K</kbd>
+      </label>
+
+      <div class="sidebar-tabs" role="tablist" aria-label="Разделы">
+        <button class="sidebar-tab active" id="chats-tab" type="button" role="tab" aria-selected="true">Чаты</button>
+        <button class="sidebar-tab" id="contacts-tab" type="button" role="tab" aria-selected="false">Контакты</button>
+      </div>
+
+      <div class="list-heading">
+        <span id="list-heading-title">Переписки</span>
+        <button class="add-contact-button" id="add-contact-button" type="button" title="Добавить контакт">＋</button>
+      </div>
+      <div class="sidebar-list" id="sidebar-list" role="list"></div>
+
+      <div class="quick-settings" aria-label="Уведомления и звук">
+        <button class="setting-toggle is-on" id="notification-toggle" type="button" aria-pressed="true" title="Включить или выключить уведомления">
+          <span class="setting-icon" aria-hidden="true">♢</span><span>Уведомления</span>
+        </button>
+        <button class="setting-toggle is-on" id="sound-toggle" type="button" aria-pressed="true" title="Включить или выключить звук">
+          <span class="setting-icon" aria-hidden="true">♫</span><span>Звук</span>
+        </button>
+      </div>
+
+      <footer class="sidebar-profile">
+        <div class="profile-avatar" id="profile-avatar">Б</div>
+        <div class="profile-copy">
+          <strong id="profile-name"></strong>
+          <span id="profile-username"></span>
+        </div>
+        <button class="icon-button logout-button" id="logout-button" type="button" aria-label="Выйти из аккаунта" title="Выйти">↪</button>
+      </footer>
+    </aside>
+
+    <section class="conversation" aria-label="Переписка">
+      <header class="conversation-header">
+        <button class="icon-button back-button" id="back-button" type="button" aria-label="Назад к чатам">‹</button>
+        <div class="active-person">
+          <div class="avatar header-avatar" id="header-avatar">Б</div>
+          <div class="person-copy">
+            <h1 id="chat-name">Бурундук</h1>
+            <span id="chat-status">Выберите контакт, чтобы начать</span>
+          </div>
+        </div>
+        <div class="header-actions">
+          <button class="icon-button call-button" id="audio-call-button" type="button" aria-label="Аудиозвонок" title="Аудиозвонок" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3H4a1 1 0 0 0-1 1c0 9.4 7.6 17 17 17a1 1 0 0 0 1-1v-3l-5-2-2 2a14 14 0 0 1-6-6l2-2-2-5Z"></path></svg>
+          </button>
+          <button class="icon-button call-button" id="video-call-button" type="button" aria-label="Видеозвонок" title="Видеозвонок" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="3"></rect><path d="m16 10 5-3v10l-5-3"></path></svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="empty-conversation" id="empty-conversation">
+        <div class="empty-emblem">🐿️</div>
+        <h2>Здесь будут ваши разговоры</h2>
+        <p>Добавьте контакт по никнейму, чтобы написать или позвонить.</p>
+        <button class="primary-button" id="empty-add-contact" type="button">Добавить контакт <span>→</span></button>
+      </div>
+
+      <div class="messages-area hidden" id="messages-area" aria-live="polite">
+        <div class="message-list" id="messages"></div>
+        <div class="typing-indicator" id="typing-indicator" hidden><span></span><span></span><span></span><label>печатает</label></div>
+      </div>
+
+      <form class="composer hidden" id="message-form">
+        <input id="message-input" type="text" placeholder="Написать сообщение..." autocomplete="off" aria-label="Текст сообщения" maxlength="4000">
+        <button class="icon-button emoji-button" type="button" aria-label="Добавить смайлик" title="Смайлик">☺</button>
+        <button class="send-button" id="send-button" type="submit" aria-label="Отправить сообщение" title="Отправить">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 3-7.2 18-3.7-7.1L3 10.2 21 3Z"></path><path d="m10.1 13.9 5-5"></path></svg>
+        </button>
+      </form>
+      <p class="composer-hint hidden" id="composer-hint">Enter — отправить · Shift + Enter — новая строка</p>
+    </section>
+  </main>
+
+  <dialog class="app-dialog" id="contact-dialog">
+    <form id="contact-form">
+      <div class="dialog-heading">
+        <div><span class="eyebrow">ВАША АДРЕСНАЯ КНИГА</span><h2>Добавить контакт</h2></div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="contact-dialog" aria-label="Закрыть">×</button>
+      </div>
+      <label class="form-field">
+        <span>Никнейм пользователя</span>
+        <div class="input-with-prefix"><span>@</span><input id="contact-username" name="username" type="text" minlength="3" maxlength="30" pattern="[A-Za-z0-9_]{3,30}" placeholder="точный никнейм" required></div>
+      </label>
+      <p class="dialog-help">Пользователь должен сначала создать аккаунт в Бурундуке.</p>
+      <p class="form-error" id="contact-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="secondary-button" type="button" data-close-dialog="contact-dialog">Отмена</button>
+        <button class="primary-button" type="submit">Найти и добавить <span>→</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="call-dialog" id="call-dialog">
+    <div class="call-heading">
+      <div><span class="eyebrow">ЗАЩИЩЁННЫЙ ЗВОНОК</span><h2 id="call-title">Соединяем...</h2></div>
+      <button class="icon-button dialog-close" type="button" id="close-call-button" aria-label="Закрыть звонок">×</button>
+    </div>
+    <div class="video-stage">
+      <div class="remote-placeholder" id="remote-placeholder"><span>🐿️</span><strong id="remote-name"></strong><small id="call-status">Ожидание соединения</small></div>
+      <video class="remote-video" id="remote-video" autoplay playsinline></video>
+      <video class="local-video" id="local-video" autoplay muted playsinline></video>
+    </div>
+    <div class="incoming-actions" id="incoming-actions" hidden>
+      <button class="decline-button" id="decline-call-button" type="button">Отклонить</button>
+      <button class="answer-button" id="answer-call-button" type="button">Ответить</button>
+    </div>
+    <div class="call-controls" id="call-controls">
+      <button class="call-control" id="mute-button" type="button" aria-label="Выключить микрофон" title="Микрофон">♩</button>
+      <button class="call-control" id="camera-button" type="button" aria-label="Выключить камеру" title="Камера">▣</button>
+      <button class="end-call-button" id="end-call-button" type="button" aria-label="Завершить звонок" title="Завершить звонок">☎</button>
+    </div>
+    <button class="toast call-toast" id="call-toast" type="button" role="status" aria-live="polite"></button>
+  </dialog>
+
+  <button class="toast" id="toast" type="button" role="status" aria-live="polite"></button>
+  <script src="app.js"></script>
+</body>
+</html>
