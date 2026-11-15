@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#191c1c">
-  <meta name="description" content="Бурундук — личные сообщения и звонки.">
+  <meta name="description" content="Бурундук — личные и групповые чаты, сообщения и звонки.">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>Бурундук — мессенджер</title>
@@ -26,7 +26,7 @@
       <div class="auth-intro">
         <span class="eyebrow">ВАШЕ ПРОСТРАНСТВО ДЛЯ ОБЩЕНИЯ</span>
         <h1 id="auth-title">На связи —<br><span>по-настоящему.</span></h1>
-        <p>Личные сообщения и звонки. Без случайных собеседников.</p>
+        <p>Личные и групповые чаты, звонки и общение только с вашими контактами.</p>
       </div>
       <div class="auth-tabs" role="tablist" aria-label="Вход или регистрация">
         <button class="auth-tab active" id="login-tab" type="button" role="tab" aria-selected="true">Войти</button>
@@ -79,12 +79,14 @@
 
       <div class="sidebar-tabs" role="tablist" aria-label="Разделы">
         <button class="sidebar-tab active" id="chats-tab" type="button" role="tab" aria-selected="true">Чаты</button>
+        <button class="sidebar-tab" id="groups-tab" type="button" role="tab" aria-selected="false">Группы</button>
         <button class="sidebar-tab" id="contacts-tab" type="button" role="tab" aria-selected="false">Контакты</button>
       </div>
 
       <div class="list-heading">
         <span id="list-heading-title">Переписки</span>
         <button class="add-contact-button" id="add-contact-button" type="button" title="Добавить контакт">＋</button>
+        <button class="add-contact-button hidden" id="create-group-button" type="button" title="Создать группу">＋</button>
       </div>
       <div class="sidebar-list" id="sidebar-list" role="list"></div>
 
@@ -94,6 +96,12 @@
         </button>
         <button class="setting-toggle is-on" id="sound-toggle" type="button" aria-pressed="true" title="Включить или выключить звук">
           <span class="setting-icon" aria-hidden="true">♫</span><span>Звук</span>
+        </button>
+        <button class="setting-toggle is-on" id="vibration-toggle" type="button" aria-pressed="true" title="Включить или выключить вибрацию">
+          <span class="setting-icon" aria-hidden="true">▯</span><span>Вибрация</span>
+        </button>
+        <button class="setting-toggle" id="melody-settings-button" type="button" title="Настроить мелодии">
+          <span class="setting-icon" aria-hidden="true">♫</span><span>Мелодии</span>
         </button>
       </div>
 
@@ -120,6 +128,8 @@
           </div>
         </div>
         <div class="header-actions">
+          <button class="icon-button" id="search-messages-toggle" type="button" aria-label="Поиск по истории" title="Поиск по истории" hidden>⌕</button>
+          <button class="icon-button" id="group-settings-button" type="button" aria-label="Настройки группы" title="Настройки группы" hidden>⋯</button>
           <button class="icon-button call-button" id="audio-call-button" type="button" aria-label="Аудиозвонок" title="Аудиозвонок" disabled>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3H4a1 1 0 0 0-1 1c0 9.4 7.6 17 17 17a1 1 0 0 0 1-1v-3l-5-2-2 2a14 14 0 0 1-6-6l2-2-2-5Z"></path></svg>
           </button>
@@ -128,6 +138,13 @@
           </button>
         </div>
       </header>
+
+      <div class="message-search hidden" id="message-search">
+        <input id="message-search-input" type="search" placeholder="Поиск в истории группы" autocomplete="off" aria-label="Поиск по истории группы">
+        <span id="message-search-count" aria-live="polite"></span>
+        <button class="icon-button" id="message-search-close" type="button" aria-label="Закрыть поиск">×</button>
+      </div>
+      <div class="pinned-message hidden" id="pinned-message"></div>
 
       <div class="empty-conversation" id="empty-conversation">
         <div class="empty-emblem">🐿️</div>
@@ -192,12 +209,114 @@
         <legend>Аватар — выберите животное</legend>
         <div class="animal-avatar-picker" id="animal-avatar-picker" role="group" aria-label="Аватар животного"></div>
       </fieldset>
+      <label class="form-field">
+        <span>Коротко о себе</span>
+        <textarea id="profile-bio" maxlength="160" rows="3" placeholder="Чем вы увлекаетесь?"></textarea>
+        <small class="field-counter" id="profile-bio-count">0 / 160</small>
+      </label>
       <p class="form-error" id="profile-error" role="alert" hidden></p>
       <div class="dialog-actions">
         <button class="secondary-button" type="button" data-close-dialog="profile-dialog">Отмена</button>
         <button class="primary-button" id="profile-save-button" type="submit">Сохранить</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog class="app-dialog group-dialog" id="create-group-dialog">
+    <form id="create-group-form">
+      <div class="dialog-heading">
+        <div><span class="eyebrow">НОВОЕ ПРОСТРАНСТВО</span><h2>Создать группу</h2></div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="create-group-dialog" aria-label="Закрыть">×</button>
+      </div>
+      <label class="form-field"><span>Название</span><input id="new-group-name" maxlength="60" minlength="2" placeholder="Например, Походы" required></label>
+      <label class="form-field"><span>Описание</span><textarea id="new-group-description" maxlength="160" rows="2" placeholder="О чём эта группа"></textarea></label>
+      <label class="form-field"><span>Значок группы</span>
+        <select id="new-group-avatar">
+          <option>👥</option><option>🐿️</option><option>🦊</option><option>🐻</option>
+          <option>🐼</option><option>🐨</option><option>🐯</option><option>🦁</option>
+        </select>
+      </label>
+      <fieldset class="member-picker-field">
+        <legend>Участники <small>Выберите хотя бы одного контакта</small></legend>
+        <div class="member-picker" id="create-group-members"></div>
+      </fieldset>
+      <p class="form-error" id="create-group-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="secondary-button" type="button" data-close-dialog="create-group-dialog">Отмена</button>
+        <button class="primary-button" type="submit">Создать группу <span>→</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="app-dialog group-dialog" id="group-settings-dialog">
+    <form id="group-settings-form">
+      <div class="dialog-heading">
+        <div><span class="eyebrow">УПРАВЛЕНИЕ ГРУППОЙ</span><h2 id="group-settings-title">Настройки</h2></div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="group-settings-dialog" aria-label="Закрыть">×</button>
+      </div>
+      <div id="group-owner-controls">
+        <label class="form-field"><span>Название</span><input id="edit-group-name" maxlength="60" minlength="2" required></label>
+        <label class="form-field"><span>Описание</span><textarea id="edit-group-description" maxlength="160" rows="2"></textarea></label>
+        <label class="form-field"><span>Значок группы</span>
+          <select id="edit-group-avatar">
+            <option>👥</option><option>🐿️</option><option>🦊</option><option>🐻</option>
+            <option>🐼</option><option>🐨</option><option>🐯</option><option>🦁</option>
+          </select>
+        </label>
+        <div class="member-picker-field">
+          <strong>Участники</strong>
+          <div class="group-member-list" id="group-member-list"></div>
+          <div class="member-add-row">
+            <select id="group-add-member-select" aria-label="Контакт для добавления"></select>
+            <button class="secondary-button" id="group-add-member-button" type="button">Добавить</button>
+          </div>
+        </div>
+        <div class="member-add-row">
+          <select id="transfer-owner-select" aria-label="Новый владелец"></select>
+          <button class="secondary-button" id="transfer-owner-button" type="button">Передать владение</button>
+        </div>
+        <button class="danger-text-button" id="delete-group-button" type="button">Удалить группу</button>
+      </div>
+      <p class="form-error" id="group-settings-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="secondary-button" id="leave-group-button" type="button">Покинуть группу</button>
+        <button class="secondary-button" type="button" data-close-dialog="group-settings-dialog">Закрыть</button>
+        <button class="primary-button" id="save-group-settings-button" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="app-dialog sound-settings-dialog" id="sound-settings-dialog">
+    <div class="dialog-heading">
+      <div><span class="eyebrow">ЗВУК И ВИБРАЦИЯ</span><h2>Мелодии</h2></div>
+      <button class="icon-button dialog-close" type="button" data-close-dialog="sound-settings-dialog" aria-label="Закрыть">×</button>
+    </div>
+    <div class="sound-setting-row">
+      <label class="form-field" for="notification-melody">
+        <span>Мелодия сообщений</span>
+        <select id="notification-melody">
+          <option value="1">Капли</option>
+          <option value="2">Колокольчики</option>
+          <option value="3">Бурундук</option>
+        </select>
+      </label>
+      <button class="secondary-button melody-preview-button" id="notification-melody-preview" type="button" aria-label="Прослушать мелодию сообщений" title="Прослушать">▶</button>
+    </div>
+    <div class="sound-setting-row">
+      <label class="form-field" for="call-melody">
+        <span>Мелодия звонка</span>
+        <select id="call-melody">
+          <option value="1">Капли</option>
+          <option value="2">Колокольчики</option>
+          <option value="3">Бурундук</option>
+        </select>
+      </label>
+      <button class="secondary-button melody-preview-button" id="call-melody-preview" type="button" aria-label="Прослушать мелодию звонка" title="Прослушать">▶</button>
+    </div>
+    <p class="dialog-help">Предпрослушивание и выбранные мелодии работают, пока приложение открыто. Звук push-уведомлений задаётся браузером и системой.</p>
+    <div class="dialog-actions">
+      <button class="secondary-button" type="button" data-close-dialog="sound-settings-dialog">Готово</button>
+    </div>
   </dialog>
 
   <dialog class="call-dialog" id="call-dialog">
@@ -209,6 +328,7 @@
       <div class="remote-placeholder" id="remote-placeholder"><span>🐿️</span><strong id="remote-name"></strong><small id="call-status">Ожидание соединения</small></div>
       <video class="remote-video" id="remote-video" autoplay playsinline></video>
       <video class="local-video" id="local-video" autoplay muted playsinline></video>
+      <div class="group-video-grid hidden" id="group-video-grid"></div>
     </div>
     <div class="incoming-actions" id="incoming-actions" hidden>
       <button class="decline-button" id="decline-call-button" type="button">Отклонить</button>

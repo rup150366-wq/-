@@ -15,7 +15,10 @@ const DATA_FILE = join(DATA_DIR, "messenger.json");
 const VAPID_KEYS_FILE = join(DATA_DIR, "vapid-keys.json");
 const PROFILE_AVATARS = new Set(["🐿️", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐸", "🐵", "🐰", "🦝", "🦉", "🦔", "🐹", "🐶", "🐱", "🐧", "🐤"]);
 const MESSAGE_REACTIONS = new Set(["👍", "❤️", "😂", "😮", "😢", "👏"]);
+const GROUP_AVATARS = new Set(["👥", "🐿️", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁"]);
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MAX_GROUP_MEMBERS = 50;
+const MAX_GROUP_CALL_PARTICIPANTS = 6;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CLIENT_FILES = new Map([
   ["/", "Index.html"],
@@ -53,8 +56,14 @@ webPush.setVapidDetails(
 let database = existsSync(DATA_FILE)
   ? JSON.parse(readFileSync(DATA_FILE, "utf8"))
   : { users: [], messages: [] };
+if (!Array.isArray(database.groups)) database.groups = [];
+for (const user of database.users) {
+  if (typeof user.bio !== "string") user.bio = "";
+  if (!Array.isArray(user.contacts)) user.contacts = [];
+}
 const sessions = new Map();
 const connections = new Map();
+const groupCalls = new Map();
 
 function saveDatabase() {
   const temporaryFile = `${DATA_FILE}.tmp`;
@@ -123,7 +132,11 @@ function sendPushToUser(userId, payload) {
   if (!user || !Array.isArray(user.pushSubscriptions) || user.pushSubscriptions.length === 0) return;
   const subscriptions = [...user.pushSubscriptions];
   void Promise.allSettled(subscriptions.map((subscription) =>
-    Promise.resolve().then(() => webPush.sendNotification(subscription, JSON.stringify(payload), { TTL: 120 }))
+    Promise.resolve().then(() => webPush.sendNotification(
+      subscription,
+      JSON.stringify({ ...payload, vibrationEnabled: subscription.vibrationEnabled !== false }),
+      { TTL: 120 }
+    ))
   )).then((results) => {
     const expiredEndpoints = new Set();
     results.forEach((result, index) => {
@@ -150,12 +163,97 @@ function belongsToConversation(message, firstUserId, secondUserId) {
     (message.fromId === secondUserId && message.toId === firstUserId);
 }
 
+function findGroup(groupId) {
+  return database.groups.find((group) => group.id === groupId);
+}
+
+function groupMember(group, userId) {
+  return group?.members.find((member) => member.userId === userId);
+}
+
+function isGroupMember(group, userId) {
+  return Boolean(groupMember(group, userId));
+}
+
+function publicGroup(group, viewerId) {
+  const lastMessage = database.messages.filter((message) => message.groupId === group.id).at(-1);
+  const members = group.members
+    .map((member) => {
+      const memberUser = findUser(member.userId);
+      return memberUser ? { ...publicUser(memberUser), role: member.role } : undefined;
+    })
+    .filter(Boolean);
+  return {
+    id: group.id,
+    name: group.name,
+    description: group.description || "",
+    avatar: GROUP_AVATARS.has(group.avatar) ? group.avatar : "👥",
+    ownerId: group.ownerId,
+    role: groupMember(group, viewerId)?.role || "member",
+    members,
+    memberCount: members.length,
+    onlineCount: members.filter((member) => member.online).length,
+    pinnedMessageId: group.pinnedMessageId || null,
+    lastMessage,
+    createdAt: group.createdAt
+  };
+}
+
+function findGroupMentions(text, group) {
+  const usernames = new Set([...text.matchAll(/@([a-z0-9_]{3,30})/gi)].map((match) => match[1].toLowerCase()));
+  return group.members
+    .map((member) => findUser(member.userId))
+    .filter((memberUser) => memberUser && usernames.has(memberUser.username))
+    .map((memberUser) => memberUser.id);
+}
+
+function sendToGroup(group, payload, excludedUserId = null) {
+  for (const member of group.members) {
+    if (member.userId !== excludedUserId) sendToUser(member.userId, payload);
+  }
+}
+
+function sendGroupUpdate(group) {
+  for (const member of group.members) {
+    sendToUser(member.userId, { type: "group-updated", group: publicGroup(group, member.userId) });
+  }
+}
+
+function sendGroupMessagePush(group, sender, message) {
+  for (const member of group.members) {
+    if (member.userId === sender.id) continue;
+    const mentioned = message.mentions.includes(member.userId);
+    sendPushToUser(member.userId, {
+      title: mentioned ? `Вас упомянули · ${group.name}` : group.name,
+      body: `${sender.name}: ${message.text.slice(0, 100)}`,
+      groupId: group.id,
+      type: "message",
+      tag: `burunduk-group-${group.id}`
+    });
+  }
+}
+
+function removeGroupCallParticipant(groupId, userId) {
+  const call = groupCalls.get(groupId);
+  if (!call || !call.participants.delete(userId)) return;
+  for (const participantId of call.participants) {
+    sendToUser(participantId, {
+      type: "group-call-participant-left",
+      groupId,
+      callId: call.id,
+      userId
+    });
+  }
+  if (call.participants.size === 0) groupCalls.delete(groupId);
+}
+
 function publicUser(user) {
   return {
     id: user.id,
     username: user.username,
     name: user.name,
     avatar: PROFILE_AVATARS.has(user.avatar) ? user.avatar : "",
+    bio: typeof user.bio === "string" ? user.bio : "",
     online: connections.has(user.id)
   };
 }
@@ -198,6 +296,7 @@ async function handleApi(request, response, url) {
       username,
       name,
       avatar: "🐿️",
+      bio: "",
       salt: salt.toString("hex"),
       passwordHash: passwordHash.toString("hex"),
       contacts: [],
@@ -242,14 +341,27 @@ async function handleApi(request, response, url) {
 
   if (request.method === "PATCH" && url.pathname === "/api/profile") {
     const body = await readBody(request);
-    if (typeof body.avatar !== "string" || !PROFILE_AVATARS.has(body.avatar)) {
+    const hasAvatar = Object.hasOwn(body, "avatar");
+    const hasBio = Object.hasOwn(body, "bio");
+    if (
+      (!hasAvatar && !hasBio) ||
+      (hasAvatar && (typeof body.avatar !== "string" || !PROFILE_AVATARS.has(body.avatar)))
+    ) {
       jsonResponse(response, 400, { error: "Выберите аватар из списка животных." });
       return;
     }
-    user.avatar = body.avatar;
+    if (hasBio && (typeof body.bio !== "string" || body.bio.trim().length > 160)) {
+      jsonResponse(response, 400, { error: "Описание профиля должно быть не длиннее 160 символов." });
+      return;
+    }
+    if (hasAvatar) user.avatar = body.avatar;
+    if (hasBio) user.bio = body.bio.trim();
     saveDatabase();
     sendToUser(user.id, { type: "profile-updated", user: publicUser(user) });
     for (const contactId of user.contacts) sendToUser(contactId, { type: "contacts-updated" });
+    for (const group of database.groups.filter((item) => isGroupMember(item, user.id))) {
+      sendGroupUpdate(group);
+    }
     jsonResponse(response, 200, { user: publicUser(user) });
     return;
   }
@@ -297,7 +409,8 @@ async function handleApi(request, response, url) {
       typeof keys?.p256dh !== "string" ||
       keys.p256dh.length > 256 ||
       typeof keys.auth !== "string" ||
-      keys.auth.length > 256
+      keys.auth.length > 256 ||
+      (subscription.vibrationEnabled !== undefined && typeof subscription.vibrationEnabled !== "boolean")
     ) {
       jsonResponse(response, 400, { error: "Некорректная push-подписка." });
       return;
@@ -305,7 +418,11 @@ async function handleApi(request, response, url) {
 
     const subscriptions = Array.isArray(user.pushSubscriptions) ? user.pushSubscriptions : [];
     const existingIndex = subscriptions.findIndex((item) => item.endpoint === endpoint);
-    const savedSubscription = { endpoint, keys: { p256dh: keys.p256dh, auth: keys.auth } };
+    const savedSubscription = {
+      endpoint,
+      keys: { p256dh: keys.p256dh, auth: keys.auth },
+      vibrationEnabled: subscription.vibrationEnabled !== false
+    };
     if (existingIndex < 0 && subscriptions.length >= 10) {
       jsonResponse(response, 429, { error: "Достигнут лимит устройств для уведомлений." });
       return;
@@ -361,6 +478,231 @@ async function handleApi(request, response, url) {
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/api/groups") {
+    const groups = database.groups
+      .filter((group) => isGroupMember(group, user.id))
+      .map((group) => publicGroup(group, user.id))
+      .sort((a, b) => (b.lastMessage?.createdAt || b.createdAt).localeCompare(a.lastMessage?.createdAt || a.createdAt));
+    jsonResponse(response, 200, { groups });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/groups") {
+    const body = await readBody(request);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const description = typeof body.description === "string" ? body.description.trim() : "";
+    const memberIds = Array.isArray(body.memberIds) ? body.memberIds : [];
+    if (
+      name.length < 2 ||
+      name.length > 60 ||
+      (body.description !== undefined && typeof body.description !== "string") ||
+      description.length > 160 ||
+      (body.avatar !== undefined && !GROUP_AVATARS.has(body.avatar))
+    ) {
+      jsonResponse(response, 400, { error: "Проверьте название, описание и значок группы." });
+      return;
+    }
+    if (
+      memberIds.length < 1 ||
+      memberIds.length > MAX_GROUP_MEMBERS - 1 ||
+      memberIds.some((id) => typeof id !== "string") ||
+      new Set(memberIds).size !== memberIds.length ||
+      memberIds.some((id) => !isContact(user, id))
+    ) {
+      jsonResponse(response, 400, { error: "Выберите от 1 до 49 разных пользователей из контактов." });
+      return;
+    }
+    const group = {
+      id: randomUUID(),
+      name,
+      description,
+      avatar: GROUP_AVATARS.has(body.avatar) ? body.avatar : "👥",
+      ownerId: user.id,
+      members: [
+        { userId: user.id, role: "owner" },
+        ...memberIds.map((userId) => ({ userId, role: "member" }))
+      ],
+      pinnedMessageId: null,
+      createdAt: new Date().toISOString()
+    };
+    database.groups.push(group);
+    saveDatabase();
+    for (const memberId of memberIds) {
+      sendToUser(memberId, { type: "group-updated", group: publicGroup(group, memberId) });
+    }
+    jsonResponse(response, 201, { group: publicGroup(group, user.id) });
+    return;
+  }
+
+  const groupRoute = url.pathname.match(/^\/api\/groups\/([^/]+)(?:\/(members|pin|leave|owner)(?:\/([^/]+))?)?$/);
+  if (groupRoute) {
+    const [, groupId, action, targetId] = groupRoute;
+    const group = findGroup(groupId);
+    if (!group || !isGroupMember(group, user.id)) {
+      jsonResponse(response, 404, { error: "Группа не найдена." });
+      return;
+    }
+    const isOwner = group.ownerId === user.id;
+
+    if (request.method === "GET" && !action) {
+      jsonResponse(response, 200, { group: publicGroup(group, user.id) });
+      return;
+    }
+
+    if (request.method === "PATCH" && !action) {
+      if (!isOwner) {
+        jsonResponse(response, 403, { error: "Настраивать группу может только владелец." });
+        return;
+      }
+      const body = await readBody(request);
+      if (
+        (Object.hasOwn(body, "name") && typeof body.name !== "string") ||
+        (Object.hasOwn(body, "description") && typeof body.description !== "string") ||
+        (Object.hasOwn(body, "avatar") && typeof body.avatar !== "string")
+      ) {
+        jsonResponse(response, 400, { error: "Проверьте название, описание и аватар группы." });
+        return;
+      }
+      const name = typeof body.name === "string" ? body.name.trim() : group.name;
+      const description = typeof body.description === "string" ? body.description.trim() : group.description;
+      const avatar = typeof body.avatar === "string" ? body.avatar : group.avatar;
+      if (name.length < 2 || name.length > 60 || description.length > 160 || !GROUP_AVATARS.has(avatar)) {
+        jsonResponse(response, 400, { error: "Проверьте название, описание и аватар группы." });
+        return;
+      }
+      group.name = name;
+      group.description = description;
+      group.avatar = avatar;
+      saveDatabase();
+      sendGroupUpdate(group);
+      jsonResponse(response, 200, { group: publicGroup(group, user.id) });
+      return;
+    }
+
+    if (request.method === "POST" && action === "members" && !targetId) {
+      if (!isOwner) {
+        jsonResponse(response, 403, { error: "Добавлять участников может только владелец." });
+        return;
+      }
+      const body = await readBody(request);
+      const memberUser = findUser(body.userId);
+      if (!memberUser || !isContact(user, memberUser.id)) {
+        jsonResponse(response, 403, { error: "Добавить можно только пользователя из ваших контактов." });
+        return;
+      }
+      if (isGroupMember(group, memberUser.id)) {
+        jsonResponse(response, 409, { error: "Пользователь уже состоит в группе." });
+        return;
+      }
+      if (group.members.length >= MAX_GROUP_MEMBERS) {
+        jsonResponse(response, 409, { error: "В группе достигнут лимит в 50 участников." });
+        return;
+      }
+      group.members.push({ userId: memberUser.id, role: "member" });
+      saveDatabase();
+      sendGroupUpdate(group);
+      jsonResponse(response, 200, { group: publicGroup(group, user.id) });
+      return;
+    }
+
+    if (request.method === "DELETE" && action === "members" && targetId) {
+      if (!isOwner) {
+        jsonResponse(response, 403, { error: "Удалять участников может только владелец." });
+        return;
+      }
+      if (targetId === group.ownerId) {
+        jsonResponse(response, 400, { error: "Нельзя удалить владельца группы." });
+        return;
+      }
+      if (!isGroupMember(group, targetId)) {
+        jsonResponse(response, 404, { error: "Участник не найден." });
+        return;
+      }
+      group.members = group.members.filter((member) => member.userId !== targetId);
+      removeGroupCallParticipant(group.id, targetId);
+      saveDatabase();
+      sendToUser(targetId, { type: "group-removed", groupId: group.id });
+      sendGroupUpdate(group);
+      jsonResponse(response, 200, { group: publicGroup(group, user.id) });
+      return;
+    }
+
+    if (request.method === "PATCH" && action === "owner" && !targetId) {
+      if (!isOwner) {
+        jsonResponse(response, 403, { error: "Передать владение может только текущий владелец." });
+        return;
+      }
+      const body = await readBody(request);
+      if (typeof body.userId !== "string" || body.userId === user.id || !isGroupMember(group, body.userId)) {
+        jsonResponse(response, 400, { error: "Выберите другого участника группы." });
+        return;
+      }
+      group.members = group.members.map((member) => ({
+        ...member,
+        role: member.userId === body.userId ? "owner" : member.userId === user.id ? "member" : member.role
+      }));
+      group.ownerId = body.userId;
+      saveDatabase();
+      sendGroupUpdate(group);
+      jsonResponse(response, 200, { group: publicGroup(group, user.id) });
+      return;
+    }
+
+    if (request.method === "POST" && action === "leave" && !targetId) {
+      if (isOwner) {
+        jsonResponse(response, 409, { error: "Перед выходом передайте владение другому участнику или удалите группу." });
+        return;
+      }
+      group.members = group.members.filter((member) => member.userId !== user.id);
+      removeGroupCallParticipant(group.id, user.id);
+      saveDatabase();
+      sendToUser(user.id, { type: "group-removed", groupId: group.id });
+      sendGroupUpdate(group);
+      jsonResponse(response, 200, { left: true });
+      return;
+    }
+
+    if (request.method === "PATCH" && action === "pin" && !targetId) {
+      if (!isOwner) {
+        jsonResponse(response, 403, { error: "Закреплять сообщения может только владелец." });
+        return;
+      }
+      const body = await readBody(request);
+      const messageId = body.messageId === null ? null : body.messageId;
+      if (
+        messageId !== null &&
+        (typeof messageId !== "string" ||
+          !database.messages.some((message) => message.id === messageId && message.groupId === group.id))
+      ) {
+        jsonResponse(response, 400, { error: "Сообщение для закрепления не найдено в этой группе." });
+        return;
+      }
+      group.pinnedMessageId = messageId;
+      saveDatabase();
+      sendGroupUpdate(group);
+      jsonResponse(response, 200, { group: publicGroup(group, user.id) });
+      return;
+    }
+
+    if (request.method === "DELETE" && !action) {
+      if (!isOwner) {
+        jsonResponse(response, 403, { error: "Удалить группу может только владелец." });
+        return;
+      }
+      const call = groupCalls.get(group.id);
+      if (call) {
+        sendToGroup(group, { type: "group-call-ended", groupId: group.id, callId: call.id });
+        groupCalls.delete(group.id);
+      }
+      sendToGroup(group, { type: "group-removed", groupId: group.id });
+      database.groups = database.groups.filter((item) => item.id !== group.id);
+      database.messages = database.messages.filter((message) => message.groupId !== group.id);
+      saveDatabase();
+      jsonResponse(response, 200, { deleted: true });
+      return;
+    }
+  }
+
   if (request.method === "GET" && url.pathname === "/api/chats") {
     const chats = user.contacts.map((contactId) => {
       const contact = findUser(contactId);
@@ -378,6 +720,17 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "GET" && url.pathname === "/api/messages") {
+    const groupId = url.searchParams.get("group");
+    if (groupId) {
+      const group = findGroup(groupId);
+      if (!group || !isGroupMember(group, user.id)) {
+        jsonResponse(response, 404, { error: "Группа не найдена." });
+        return;
+      }
+      const messages = database.messages.filter((message) => message.groupId === group.id);
+      jsonResponse(response, 200, { messages });
+      return;
+    }
     const contactId = url.searchParams.get("with");
     if (!contactId || !isContact(user, contactId)) {
       jsonResponse(response, 403, { error: "Сначала добавьте пользователя в контакты." });
@@ -479,13 +832,19 @@ webSocketServer.on("connection", (webSocket) => {
         return;
       }
       clearTimeout(authenticationTimeout);
+      const wasOnline = connections.has(user.id);
       if (!connections.has(user.id)) connections.set(user.id, new Set());
       connections.get(user.id).add(webSocket);
       webSocket.send(JSON.stringify({
         type: "ready",
         online: user.contacts.filter((id) => connections.has(id))
       }));
-      for (const contactId of user.contacts) sendToUser(contactId, { type: "presence", userId: user.id, online: true });
+      if (!wasOnline) {
+        for (const contactId of user.contacts) sendToUser(contactId, { type: "presence", userId: user.id, online: true });
+        for (const group of database.groups.filter((item) => isGroupMember(item, user.id))) {
+          sendToGroup(group, { type: "group-presence", groupId: group.id, userId: user.id, online: true }, user.id);
+        }
+      }
       return;
     }
 
@@ -525,6 +884,34 @@ webSocketServer.on("connection", (webSocket) => {
         contactId: user.id,
         tag: `burunduk-chat-${user.id}`
       });
+      return;
+    }
+
+    if (payload.type === "group-message") {
+      const group = typeof payload.groupId === "string" ? findGroup(payload.groupId) : undefined;
+      const text = typeof payload.text === "string" ? payload.text.trim() : "";
+      const replyToId = typeof payload.replyToId === "string" ? payload.replyToId : "";
+      const replyTarget = replyToId
+        ? database.messages.find((item) => item.id === replyToId && item.groupId === group?.id)
+        : undefined;
+      if (!group || !isGroupMember(group, user.id) || !text || text.length > 4000 || (replyToId && !replyTarget)) {
+        webSocket.send(JSON.stringify({ type: "error", error: "Не удалось отправить сообщение в группу." }));
+        return;
+      }
+      const message = {
+        id: randomUUID(),
+        groupId: group.id,
+        fromId: user.id,
+        text,
+        replyToId: replyToId || null,
+        reactions: {},
+        mentions: findGroupMentions(text, group),
+        createdAt: new Date().toISOString()
+      };
+      database.messages.push(message);
+      saveDatabase();
+      sendToGroup(group, { type: "group-message", message });
+      sendGroupMessagePush(group, user, message);
       return;
     }
 
@@ -576,6 +963,31 @@ webSocketServer.on("connection", (webSocket) => {
     }
 
     if (payload.type === "reaction") {
+      if (typeof payload.groupId === "string") {
+        const group = findGroup(payload.groupId);
+        const groupMessage = database.messages.find((item) => item.id === payload.messageId && item.groupId === group?.id);
+        if (!group || !isGroupMember(group, user.id) || !groupMessage || !MESSAGE_REACTIONS.has(payload.emoji)) {
+          webSocket.send(JSON.stringify({ type: "error", error: "Не удалось изменить реакцию." }));
+          return;
+        }
+        if (!groupMessage.reactions || typeof groupMessage.reactions !== "object" || Array.isArray(groupMessage.reactions)) {
+          groupMessage.reactions = {};
+        }
+        const users = Array.isArray(groupMessage.reactions[payload.emoji]) ? groupMessage.reactions[payload.emoji] : [];
+        const userIndex = users.indexOf(user.id);
+        if (userIndex >= 0) users.splice(userIndex, 1);
+        else users.push(user.id);
+        if (users.length > 0) groupMessage.reactions[payload.emoji] = users;
+        else delete groupMessage.reactions[payload.emoji];
+        saveDatabase();
+        sendToGroup(group, {
+          type: "reaction",
+          groupId: group.id,
+          messageId: groupMessage.id,
+          reactions: groupMessage.reactions
+        });
+        return;
+      }
       const recipient = findUser(payload.toId);
       const message = database.messages.find((item) => item.id === payload.messageId);
       if (
@@ -610,7 +1022,140 @@ webSocketServer.on("connection", (webSocket) => {
     }
 
     if (payload.type === "typing") {
+      if (typeof payload.groupId === "string") {
+        const group = findGroup(payload.groupId);
+        if (group && isGroupMember(group, user.id)) {
+          sendToGroup(group, { type: "group-typing", groupId: group.id, fromId: user.id, active: Boolean(payload.active) }, user.id);
+        }
+        return;
+      }
       if (isContact(user, payload.toId)) sendToUser(payload.toId, { type: "typing", fromId: user.id, active: Boolean(payload.active) });
+      return;
+    }
+
+    if (payload.type === "group-call") {
+      const group = typeof payload.groupId === "string" ? findGroup(payload.groupId) : undefined;
+      const action = payload.action;
+      const callError = (error) => webSocket.send(JSON.stringify({
+        type: "error",
+        error,
+        requestType: "group-call",
+        groupId: payload.groupId,
+        callId: payload.callId
+      }));
+      if (!group || !isGroupMember(group, user.id)) {
+        callError("Группа не найдена или вы не состоите в ней.");
+        return;
+      }
+      if (action === "start") {
+        if (groupCalls.has(group.id)) {
+          callError("В группе уже идёт звонок.");
+          return;
+        }
+        if (typeof payload.callId !== "string" || !UUID_PATTERN.test(payload.callId)) {
+          callError("Не удалось начать групповой звонок.");
+          return;
+        }
+        const call = {
+          id: payload.callId,
+          groupId: group.id,
+          startedBy: user.id,
+          video: Boolean(payload.video),
+          participants: new Set([user.id])
+        };
+        groupCalls.set(group.id, call);
+        sendToUser(user.id, { type: "group-call-started", groupId: group.id, callId: call.id });
+        for (const member of group.members) {
+          if (member.userId === user.id) continue;
+          sendToUser(member.userId, {
+            type: "group-call-incoming",
+            groupId: group.id,
+            callId: call.id,
+            from: publicUser(user),
+            video: call.video
+          });
+          sendPushToUser(member.userId, {
+            title: `Групповой ${call.video ? "видеозвонок" : "звонок"} · ${group.name}`,
+            body: `${user.name} начал(а) звонок`,
+            groupId: group.id,
+            type: "group-call",
+            callType: call.video ? "video" : "audio",
+            tag: `burunduk-group-call-${group.id}`
+          });
+        }
+        return;
+      }
+
+      const call = groupCalls.get(group.id);
+      if (!call || call.id !== payload.callId) {
+        callError("Групповой звонок уже завершён.");
+        return;
+      }
+      if (action === "join") {
+        if (!call.participants.has(user.id) && call.participants.size >= MAX_GROUP_CALL_PARTICIPANTS) {
+          callError("В звонке максимум 6 участников.");
+          return;
+        }
+        const existingParticipants = [...call.participants]
+          .filter((participantId) => participantId !== user.id)
+          .map(findUser)
+          .filter(Boolean)
+          .map(publicUser);
+        call.participants.add(user.id);
+        sendToUser(user.id, {
+          type: "group-call-joined",
+          groupId: group.id,
+          callId: call.id,
+          participants: existingParticipants
+        });
+        sendToGroup(group, {
+          type: "group-call-participant-joined",
+          groupId: group.id,
+          callId: call.id,
+          participant: publicUser(user)
+        }, user.id);
+        return;
+      }
+      if (action === "signal") {
+        const targetId = payload.toUserId;
+        const signal = payload.signal;
+        if (
+          !call.participants.has(user.id) ||
+          typeof targetId !== "string" ||
+          !call.participants.has(targetId) ||
+          !signal ||
+          !["offer", "answer", "candidate"].includes(signal.kind)
+        ) {
+          callError("Сигнал группового звонка не прошёл проверку.");
+          return;
+        }
+        sendToUser(targetId, {
+          type: "group-call-signal",
+          groupId: group.id,
+          callId: call.id,
+          fromId: user.id,
+          signal
+        });
+        return;
+      }
+      if (action === "decline") {
+        sendToUser(call.startedBy, { type: "group-call-declined", groupId: group.id, callId: call.id, user: publicUser(user) });
+        return;
+      }
+      if (action === "leave") {
+        removeGroupCallParticipant(group.id, user.id);
+        return;
+      }
+      if (action === "end") {
+        if (call.startedBy !== user.id && group.ownerId !== user.id) {
+          callError("Завершить звонок для всех может только владелец или инициатор.");
+          return;
+        }
+        sendToGroup(group, { type: "group-call-ended", groupId: group.id, callId: call.id });
+        groupCalls.delete(group.id);
+        return;
+      }
+      callError("Неизвестное действие группового звонка.");
       return;
     }
 
@@ -657,6 +1202,10 @@ webSocketServer.on("connection", (webSocket) => {
     if (userSockets?.size === 0) {
       connections.delete(user.id);
       for (const contactId of user.contacts) sendToUser(contactId, { type: "presence", userId: user.id, online: false });
+      for (const group of database.groups.filter((item) => isGroupMember(item, user.id))) {
+        sendToGroup(group, { type: "group-presence", groupId: group.id, userId: user.id, online: false }, user.id);
+      }
+      for (const group of database.groups) removeGroupCallParticipant(group.id, user.id);
     }
   });
   webSocket.on("error", (error) => console.error("WebSocket error:", error.message));

@@ -1,7 +1,21 @@
 const TOKEN_KEY = "burunduk-token";
 const THEME_KEY = "burunduk-theme";
+const NOTIFICATION_MELODY_KEY = "burunduk-notification-melody";
+const CALL_MELODY_KEY = "burunduk-call-melody";
+const VIBRATION_KEY = "burunduk-vibration";
 const ANIMAL_AVATARS = ["🐿️", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐸", "🐵", "🐰", "🦝", "🦉", "🦔", "🐹", "🐶", "🐱", "🐧", "🐤"];
 const MESSAGE_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "👏"];
+const MELODY_OPTIONS = ["1", "2", "3"];
+const NOTIFICATION_MELODIES = {
+  "1": [[660, 0.12, 0], [880, 0.18, 160]],
+  "2": [[523, 0.12, 0], [659, 0.12, 170], [784, 0.2, 340]],
+  "3": [[784, 0.1, 0], [1046, 0.12, 130], [784, 0.1, 280], [1046, 0.2, 420]]
+};
+const CALL_MELODIES = {
+  "1": [[523, 0.18, 0], [659, 0.2, 220], [784, 0.34, 480]],
+  "2": [[659, 0.2, 0], [523, 0.2, 260], [659, 0.42, 520]],
+  "3": [[740, 0.18, 0], [880, 0.18, 220], [740, 0.18, 440], [587, 0.34, 680]]
+};
 const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
 const FILE_CHUNK_BYTES = 16 * 1024;
 const MEDIA_STORE_NAME = "attachments";
@@ -27,7 +41,9 @@ let authMode = "login";
 let currentUser = null;
 let contacts = [];
 let chats = [];
+let groups = [];
 let currentContact = null;
+let currentGroup = null;
 let activeSection = "chats";
 let socket = null;
 let reconnectTimer = null;
@@ -44,6 +60,8 @@ let iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
 let callTimer = null;
 let callSoundTimer = null;
 let callSoundTimeouts = [];
+let callVibrationTimer = null;
+let callAlertActive = false;
 let audioContext = null;
 let toastAction = null;
 let pushNotificationsConfigured = false;
@@ -52,6 +70,8 @@ let serviceWorkerReady = null;
 let selectedAvatar = null;
 let pendingReplyToId = null;
 let currentMessagesById = new Map();
+let groupCall = null;
+let incomingGroupCall = null;
 let mediaDatabasePromise = null;
 const fileLinks = new Map();
 const outgoingTransfers = new Map();
@@ -59,14 +79,24 @@ const incomingTransfers = new Map();
 const mediaObjectUrls = new Set();
 const initialUrl = new URLSearchParams(location.search);
 let pendingNotificationContactId = initialUrl.get("contact");
+let pendingNotificationGroupId = initialUrl.get("group");
 let pendingMissedCallNotification = initialUrl.get("missedCall") === "1";
+let pendingMissedGroupCallNotification = initialUrl.get("missedCall") === "1" && Boolean(initialUrl.get("group"));
 let notificationsEnabled = localStorage.getItem("burunduk-notifications") !== "false";
 let soundEnabled = localStorage.getItem("burunduk-sound") !== "false";
+let vibrationEnabled = localStorage.getItem(VIBRATION_KEY) !== "false";
+let notificationMelody = readMelodyPreference(NOTIFICATION_MELODY_KEY);
+let callMelody = readMelodyPreference(CALL_MELODY_KEY);
+
+function readMelodyPreference(key) {
+  const value = localStorage.getItem(key);
+  return MELODY_OPTIONS.includes(value) ? value : "1";
+}
 
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return Promise.resolve(null);
   if (!serviceWorkerReady) {
-    serviceWorkerReady = navigator.serviceWorker.register("/service-worker.js?v=4", { scope: "/" })
+    serviceWorkerReady = navigator.serviceWorker.register("/service-worker.js?v=6", { scope: "/" })
       .then(() => navigator.serviceWorker.ready)
       .catch((error) => {
         console.warn("Не удалось зарегистрировать Service Worker:", error);
@@ -100,6 +130,8 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.addEventListener("message", (event) => {
     if (event.data?.type === "notification-click" && typeof event.data.contactId === "string") {
       openNotificationContact(event.data.contactId, event.data.notificationType);
+    } else if (event.data?.type === "notification-click" && typeof event.data.groupId === "string") {
+      openNotificationGroup(event.data.groupId, event.data.notificationType);
     }
   });
 }
@@ -209,16 +241,22 @@ function showNotification(title, body, contactId, serverPushWillNotify = false) 
   void showSystemNotification(title, body, contactId, serverPushWillNotify);
 }
 
-async function showSystemNotification(title, body, contactId, serverPushWillNotify) {
+function showGroupNotification(title, body, groupId, serverPushWillNotify = false) {
+  if (!notificationsEnabled) return;
+  showToast(`${title}: ${body}`, () => openNotificationGroup(groupId));
+  void showSystemNotification(title, body, null, serverPushWillNotify, groupId);
+}
+
+async function showSystemNotification(title, body, contactId, serverPushWillNotify, groupId = null) {
   if (!document.hidden || !("Notification" in window) || Notification.permission !== "granted") return;
   if (serverPushWillNotify && pushNotificationsConfigured) return;
   const options = {
     body,
-    tag: `burunduk-${contactId}`,
+    tag: groupId ? `burunduk-group-${groupId}` : `burunduk-${contactId}`,
     icon: "/icon-192.png",
     badge: "/icon-192.png",
-    vibrate: [180, 80, 180],
-    data: { contactId }
+    vibrate: vibrationEnabled ? [180, 80, 180] : [],
+    data: { contactId, groupId }
   };
   try {
     const registration = await getServiceWorkerRegistration();
@@ -275,7 +313,9 @@ async function syncPushSubscription() {
     }
     await api("/api/push/subscribe", {
       method: "POST",
-      body: JSON.stringify({ subscription: subscription.toJSON() })
+      body: JSON.stringify({
+        subscription: { ...subscription.toJSON(), vibrationEnabled }
+      })
     });
     pushSetupIssue = "";
     pushNotificationsConfigured = true;
@@ -352,6 +392,18 @@ function openNotificationContact(contactId, notificationType = "message") {
   pendingMissedCallNotification = notificationType === "call";
 }
 
+function openNotificationGroup(groupId, notificationType = "message") {
+  const group = groups.find((item) => item.id === groupId);
+  if (group) {
+    pendingNotificationGroupId = null;
+    focusGroup(group);
+    if (notificationType === "group-call") showToast("Групповой звонок мог завершиться. Вы можете позвонить из группы.");
+    return;
+  }
+  pendingNotificationGroupId = groupId;
+  pendingMissedGroupCallNotification = notificationType === "group-call";
+}
+
 function focusContact(contact) {
   activeSection = "chats";
   searchInput.value = "";
@@ -359,11 +411,32 @@ function focusContact(contact) {
   selectContact(contact);
 }
 
+function focusGroup(group) {
+  activeSection = "groups";
+  searchInput.value = "";
+  renderSidebar();
+  selectGroup(group);
+}
 function updateSoundControls() {
   const button = document.querySelector("#sound-toggle");
   button.classList.toggle("is-on", soundEnabled);
   button.setAttribute("aria-pressed", String(soundEnabled));
   button.querySelector("span:last-child").textContent = soundEnabled ? "Звук вкл." : "Звук выкл.";
+}
+
+function updateVibrationControls() {
+  const button = document.querySelector("#vibration-toggle");
+  button.classList.toggle("is-on", vibrationEnabled);
+  button.setAttribute("aria-pressed", String(vibrationEnabled));
+  button.querySelector("span:last-child").textContent = vibrationEnabled ? "Вибрация" : "Без вибрации";
+  button.title = typeof navigator.vibrate === "function"
+    ? "Включить или выключить вибрацию сообщений и звонков"
+    : "Вибрация зависит от поддержки браузера и устройства";
+}
+
+function updateMelodyControls() {
+  document.querySelector("#notification-melody").value = notificationMelody;
+  document.querySelector("#call-melody").value = callMelody;
 }
 
 function updateNotificationControls() {
@@ -407,6 +480,20 @@ function playTone(frequency, duration = 0.13, volume = 0.18) {
   scheduleTone(frequency, duration, volume);
 }
 
+function playMelody(notes, volume = 0.2, timeoutCollection = null) {
+  for (const [frequency, duration, delay] of notes) {
+    let timeoutId;
+    timeoutId = setTimeout(() => {
+      if (timeoutCollection) {
+        const index = timeoutCollection.indexOf(timeoutId);
+        if (index >= 0) timeoutCollection.splice(index, 1);
+      }
+      playTone(frequency, duration, volume);
+    }, delay);
+    if (timeoutCollection) timeoutCollection.push(timeoutId);
+  }
+}
+
 function scheduleTone(frequency, duration, volume) {
   if (!audioContext || audioContext.state !== "running") return;
   const oscillator = audioContext.createOscillator();
@@ -423,27 +510,72 @@ function scheduleTone(frequency, duration, volume) {
   oscillator.stop(now + duration);
 }
 
-function playMessageSound() {
-  playTone(680, 0.12, 0.2);
-  setTimeout(() => playTone(880, 0.14, 0.2), 110);
+function vibrateDevice(pattern) {
+  if (!vibrationEnabled || typeof navigator.vibrate !== "function") return false;
+  try {
+    return navigator.vibrate(pattern);
+  } catch (error) {
+    console.warn("Вибрация недоступна:", error);
+    return false;
+  }
 }
 
-function startCallSound() {
-  stopCallSound();
+function cancelDeviceVibration() {
+  if (typeof navigator.vibrate !== "function") return;
+  try {
+    navigator.vibrate(0);
+  } catch (error) {
+    console.warn("Не удалось остановить вибрацию:", error);
+  }
+}
+
+function playMessageSound() {
+  if (soundEnabled) playMelody(NOTIFICATION_MELODIES[notificationMelody], 0.2);
+  vibrateDevice([90, 50, 90]);
+}
+
+function startCallAudio() {
+  stopCallAudio();
   if (!soundEnabled) return;
   const ring = () => {
-    playTone(560, 0.3, 0.18);
-    callSoundTimeouts.push(setTimeout(() => playTone(740, 0.3, 0.18), 360));
+    playMelody(CALL_MELODIES[callMelody], 0.18, callSoundTimeouts);
   };
   ring();
-  callSoundTimer = setInterval(ring, 1900);
+  callSoundTimer = setInterval(ring, 2300);
 }
 
-function stopCallSound() {
+function stopCallAudio() {
   clearInterval(callSoundTimer);
   callSoundTimer = null;
   callSoundTimeouts.forEach(clearTimeout);
   callSoundTimeouts = [];
+}
+
+function startCallVibration() {
+  stopCallVibration();
+  if (!vibrationEnabled) return;
+  const ring = () => vibrateDevice([260, 120, 260, 650]);
+  ring();
+  callVibrationTimer = setInterval(ring, 2300);
+}
+
+function stopCallVibration() {
+  clearInterval(callVibrationTimer);
+  callVibrationTimer = null;
+  cancelDeviceVibration();
+}
+
+function startCallSound() {
+  stopCallSound();
+  callAlertActive = true;
+  startCallAudio();
+  startCallVibration();
+}
+
+function stopCallSound() {
+  callAlertActive = false;
+  stopCallAudio();
+  stopCallVibration();
 }
 
 document.querySelector("#toast").addEventListener("click", () => {
@@ -468,12 +600,58 @@ document.querySelector("#sound-toggle").addEventListener("click", () => {
   soundEnabled = !soundEnabled;
   localStorage.setItem("burunduk-sound", String(soundEnabled));
   updateSoundControls();
-  if (soundEnabled) {
+  if (callAlertActive) {
+    if (soundEnabled) startCallAudio();
+    else stopCallAudio();
+  } else if (soundEnabled) {
     unlockSound();
-    playTone(760, 0.12);
-  } else {
-    stopCallSound();
+    playMelody(NOTIFICATION_MELODIES[notificationMelody], 0.2);
   }
+});
+
+document.querySelector("#vibration-toggle").addEventListener("click", () => {
+  vibrationEnabled = !vibrationEnabled;
+  localStorage.setItem(VIBRATION_KEY, String(vibrationEnabled));
+  updateVibrationControls();
+  if (callAlertActive) {
+    if (vibrationEnabled) startCallVibration();
+    else stopCallVibration();
+  } else if (!vibrationEnabled) {
+    cancelDeviceVibration();
+  }
+  if (pushNotificationsConfigured && notificationsEnabled) {
+    void syncPushSubscription().then((updated) => {
+      if (!updated) showToast("Вибрация сохранена на этом устройстве, но push-настройка не обновилась.");
+    });
+  }
+});
+
+document.querySelector("#melody-settings-button").addEventListener("click", () => {
+  updateMelodyControls();
+  document.querySelector("#sound-settings-dialog").showModal();
+});
+document.querySelector("#notification-melody").addEventListener("change", (event) => {
+  notificationMelody = event.currentTarget.value;
+  localStorage.setItem(NOTIFICATION_MELODY_KEY, notificationMelody);
+});
+document.querySelector("#call-melody").addEventListener("change", (event) => {
+  callMelody = event.currentTarget.value;
+  localStorage.setItem(CALL_MELODY_KEY, callMelody);
+  if (callAlertActive && soundEnabled) startCallAudio();
+});
+document.querySelector("#notification-melody-preview").addEventListener("click", () => {
+  if (!soundEnabled) {
+    showToast("Сначала включите звук в настройках.");
+    return;
+  }
+  playMelody(NOTIFICATION_MELODIES[notificationMelody], 0.22);
+});
+document.querySelector("#call-melody-preview").addEventListener("click", () => {
+  if (!soundEnabled) {
+    showToast("Сначала включите звук в настройках.");
+    return;
+  }
+  playMelody(CALL_MELODIES[callMelody], 0.2);
 });
 
 document.querySelector("#notification-toggle").addEventListener("click", async () => {
@@ -497,6 +675,8 @@ document.querySelector("#notification-toggle").addEventListener("click", async (
 });
 
 updateSoundControls();
+updateVibrationControls();
+updateMelodyControls();
 updateNotificationControls();
 
 async function api(path, options = {}) {
@@ -574,7 +754,7 @@ async function enterMessenger() {
   authScreen.classList.add("hidden");
   appScreen.classList.remove("hidden");
   updateProfilePresentation();
-  await Promise.all([loadContacts(), loadChats()]);
+  await Promise.all([loadContacts(), loadChats(), loadGroups()]);
   if (pendingNotificationContactId) {
     const contact = contactById(pendingNotificationContactId);
     if (contact) {
@@ -584,6 +764,18 @@ async function enterMessenger() {
       history.replaceState(null, "", location.pathname);
       await selectContact(contact);
       if (missedCallNotification) showToast("Звонок пропущен. Вы можете перезвонить из чата.");
+    }
+  }
+  if (pendingNotificationGroupId) {
+    const group = groups.find((item) => item.id === pendingNotificationGroupId);
+    if (group) {
+      pendingNotificationGroupId = null;
+      history.replaceState(null, "", location.pathname);
+      await selectGroup(group);
+      if (pendingMissedGroupCallNotification) {
+        pendingMissedGroupCallNotification = false;
+        showToast("Групповой звонок мог завершиться. Вы можете позвонить из группы.");
+      }
     }
   }
   if (notificationsEnabled && "Notification" in window && Notification.permission === "granted") {
@@ -619,6 +811,24 @@ async function loadChats() {
   renderSidebar();
 }
 
+async function loadGroups() {
+  const result = await api("/api/groups");
+  groups = result.groups;
+  if (currentGroup) {
+    const updatedGroup = groups.find((group) => group.id === currentGroup.id);
+    if (updatedGroup) {
+      currentGroup = updatedGroup;
+      updateGroupHeader(currentGroup);
+      if (!messagesArea.classList.contains("hidden")) renderMessages([...currentMessagesById.values()]);
+    }
+    else {
+      currentGroup = null;
+      showEmptyConversation();
+    }
+  }
+  renderSidebar();
+}
+
 function nameInitial(name) {
   return name.trim().charAt(0).toLocaleUpperCase("ru") || "?";
 }
@@ -632,7 +842,8 @@ function setAvatarElement(element, user) {
 function updateProfilePresentation() {
   if (!currentUser) return;
   document.querySelector("#profile-name").textContent = currentUser.name;
-  document.querySelector("#profile-username").textContent = `@${currentUser.username}`;
+  document.querySelector("#profile-username").textContent =
+    `@${currentUser.username}${currentUser.bio ? ` · ${currentUser.bio}` : ""}`;
   setAvatarElement(document.querySelector("#profile-avatar"), currentUser);
 }
 
@@ -665,33 +876,44 @@ function emptyList(title, description, actionText = "") {
 function renderSidebar() {
   sidebarList.replaceChildren();
   const query = searchInput.value.trim().toLocaleLowerCase("ru");
-  const source = activeSection === "chats" ? chats : contacts;
+  const source = activeSection === "chats" ? chats : activeSection === "groups" ? groups : contacts;
   const visible = source.filter((entry) =>
-    `${entry.name} ${entry.username}`.toLocaleLowerCase("ru").includes(query)
+    `${entry.name} ${entry.username || ""} ${entry.description || ""}`.toLocaleLowerCase("ru").includes(query)
   );
   document.querySelector("#chats-tab").classList.toggle("active", activeSection === "chats");
+  document.querySelector("#groups-tab").classList.toggle("active", activeSection === "groups");
   document.querySelector("#contacts-tab").classList.toggle("active", activeSection === "contacts");
   document.querySelector("#chats-tab").setAttribute("aria-selected", String(activeSection === "chats"));
+  document.querySelector("#groups-tab").setAttribute("aria-selected", String(activeSection === "groups"));
   document.querySelector("#contacts-tab").setAttribute("aria-selected", String(activeSection === "contacts"));
-  document.querySelector("#list-heading-title").textContent = activeSection === "chats" ? "Переписки" : "Ваши контакты";
-  searchInput.placeholder = activeSection === "chats" ? "Поиск по чатам" : "Поиск по контактам";
+  document.querySelector("#list-heading-title").textContent =
+    activeSection === "chats" ? "Переписки" : activeSection === "groups" ? "Группы" : "Ваши контакты";
+  document.querySelector("#add-contact-button").classList.toggle("hidden", activeSection === "groups");
+  document.querySelector("#create-group-button").classList.toggle("hidden", activeSection !== "groups");
+  searchInput.placeholder = activeSection === "chats"
+    ? "Поиск по чатам"
+    : activeSection === "groups" ? "Поиск по группам" : "Поиск по контактам";
 
   if (!visible.length) {
     sidebarList.append(activeSection === "contacts"
       ? emptyList(query ? "Никого не нашли" : "Контактов пока нет", "Добавьте человека по его никнейму.", "Добавить контакт")
-      : emptyList(query ? "Переписок не найдено" : "Новых переписок пока нет", "Откройте контакты и напишите первым."));
+      : activeSection === "groups"
+        ? emptyList(query ? "Групп не найдено" : "Групп пока нет", "Создайте группу и пригласите контакты.")
+        : emptyList(query ? "Переписок не найдено" : "Новых переписок пока нет", "Откройте контакты и напишите первым."));
     return;
   }
 
   for (const entry of visible) {
     const item = document.createElement("button");
-    item.className = `sidebar-item${currentContact?.id === entry.id ? " active" : ""}`;
+    const isGroup = activeSection === "groups";
+    item.className = `sidebar-item${(isGroup ? currentGroup?.id : currentContact?.id) === entry.id ? " active" : ""}`;
     item.type = "button";
-    item.dataset.userId = entry.id;
+    item.dataset[isGroup ? "groupId" : "userId"] = entry.id;
 
     const avatar = document.createElement("span");
-    avatar.className = `avatar${entry.online ? " online" : ""}`;
-    setAvatarElement(avatar, entry);
+    avatar.className = `avatar${!isGroup && entry.online ? " online" : ""}${isGroup ? " emoji-avatar" : ""}`;
+    if (isGroup) avatar.textContent = entry.avatar || "👥";
+    else setAvatarElement(avatar, entry);
 
     const copy = document.createElement("span");
     copy.className = "sidebar-item-copy";
@@ -700,19 +922,24 @@ function renderSidebar() {
     const name = document.createElement("strong");
     name.textContent = entry.name;
     const right = document.createElement("time");
-    if (activeSection === "chats" && entry.lastMessage) right.textContent = formatTime(entry.lastMessage.createdAt);
+    if ((activeSection === "chats" || isGroup) && entry.lastMessage) right.textContent = formatTime(entry.lastMessage.createdAt);
+    else if (isGroup) right.textContent = `${entry.memberCount} участн.`;
     else right.textContent = entry.online ? "в сети" : "";
-    if (entry.online) right.classList.add("online-label");
+    if (entry.online && !isGroup) right.classList.add("online-label");
     top.append(name, right);
 
     const bottom = document.createElement("span");
     bottom.className = "sidebar-item-bottom";
     const preview = document.createElement("span");
-    preview.textContent = activeSection === "chats"
-      ? (entry.lastMessage?.type === "attachment"
-        ? `📎 ${entry.lastMessage.attachment.name}`
-        : (entry.lastMessage?.text || ""))
-      : `@${entry.username}`;
+    if (activeSection === "contacts") preview.textContent = `@${entry.username}`;
+    else {
+      const lastMessage = entry.lastMessage;
+      const sender = isGroup ? entry.members.find((member) => member.id === lastMessage?.fromId) : null;
+      const messagePreview = lastMessage?.type === "attachment"
+        ? `📎 ${lastMessage.attachment.name}`
+        : (lastMessage?.text || entry.description || "");
+      preview.textContent = `${sender && sender.id !== currentUser.id ? `${sender.name}: ` : ""}${messagePreview}`;
+    }
     bottom.append(preview);
     copy.append(top, bottom);
     item.append(avatar, copy);
@@ -733,13 +960,54 @@ function formatMessageTime(value) {
   return new Date(value).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
 }
 
+function messageSenderName(message) {
+  if (message.fromId === currentUser.id) return "Вы";
+  if (currentGroup) return currentGroup.members.find((member) => member.id === message.fromId)?.name || "Участник";
+  return currentContact?.name || "Контакт";
+}
+
+function appendMessageText(element, text) {
+  if (!currentGroup) {
+    element.textContent = text;
+    return;
+  }
+  const memberNames = new Set(currentGroup.members.map((member) => member.username.toLowerCase()));
+  const mentionPattern = /@([a-z0-9_]{3,30})/gi;
+  let lastIndex = 0;
+  for (const match of text.matchAll(mentionPattern)) {
+    const username = match[1].toLowerCase();
+    if (!memberNames.has(username)) continue;
+    element.append(document.createTextNode(text.slice(lastIndex, match.index)));
+    const mention = document.createElement("span");
+    mention.className = "mention";
+    mention.textContent = match[0];
+    element.append(mention);
+    lastIndex = match.index + match[0].length;
+  }
+  element.append(document.createTextNode(text.slice(lastIndex)));
+}
+
 function renderMessages(items) {
   for (const objectUrl of mediaObjectUrls) URL.revokeObjectURL(objectUrl);
   mediaObjectUrls.clear();
   messagesElement.replaceChildren();
   const messagesById = new Map(items.map((message) => [message.id, message]));
   currentMessagesById = messagesById;
-  for (const message of items) {
+  const searchInputElement = document.querySelector("#message-search-input");
+  const query = currentGroup && !document.querySelector("#message-search").classList.contains("hidden")
+    ? searchInputElement.value.trim().toLocaleLowerCase("ru")
+    : "";
+  const visibleMessages = query
+    ? items.filter((message) => message.text?.toLocaleLowerCase("ru").includes(query))
+    : items;
+  document.querySelector("#message-search-count").textContent = query ? `${visibleMessages.length} / ${items.length}` : "";
+  if (query && visibleMessages.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "list-empty";
+    empty.textContent = "Совпадений не найдено";
+    messagesElement.append(empty);
+  }
+  for (const message of visibleMessages) {
     const own = message.fromId === currentUser.id;
     const row = document.createElement("div");
     row.className = `message-row${own ? " own" : ""}`;
@@ -747,12 +1015,21 @@ function renderMessages(items) {
     if (!own) {
       const avatar = document.createElement("span");
       avatar.className = "message-avatar avatar";
-      setAvatarElement(avatar, currentContact);
+      const sender = currentGroup
+        ? currentGroup.members.find((member) => member.id === message.fromId)
+        : currentContact;
+      if (sender) setAvatarElement(avatar, sender);
       row.append(avatar);
     }
 
     const wrap = document.createElement("div");
     wrap.className = "bubble-wrap";
+    if (currentGroup && !own) {
+      const author = document.createElement("div");
+      author.className = "message-author";
+      author.textContent = messageSenderName(message);
+      wrap.append(author);
+    }
     const bubble = document.createElement("div");
     bubble.className = "bubble";
     if (message.replyToId) {
@@ -760,9 +1037,7 @@ function renderMessages(items) {
       const quote = document.createElement("div");
       quote.className = "reply-quote";
       const quoteAuthor = document.createElement("strong");
-      quoteAuthor.textContent = repliedTo
-        ? (repliedTo.fromId === currentUser.id ? "Вы" : currentContact.name)
-        : "Ответ";
+      quoteAuthor.textContent = repliedTo ? messageSenderName(repliedTo) : "Ответ";
       const quoteText = document.createElement("span");
       quoteText.textContent = repliedTo
         ? (repliedTo.type === "attachment" ? `📎 ${repliedTo.attachment.name}` : repliedTo.text)
@@ -775,7 +1050,7 @@ function renderMessages(items) {
     } else {
       const text = document.createElement("span");
       text.className = "message-text";
-      text.textContent = message.text;
+      appendMessageText(text, message.text);
       bubble.append(text);
     }
     const reactions = document.createElement("div");
@@ -830,13 +1105,47 @@ function renderMessages(items) {
     }
     reactionsWrap.append(reactionsButton, picker);
     actions.append(replyButton, reactionsWrap);
+    if (currentGroup?.role === "owner" && message.type !== "attachment") {
+      const pinButton = document.createElement("button");
+      pinButton.className = "message-action";
+      pinButton.type = "button";
+      pinButton.dataset.messageAction = "pin";
+      pinButton.dataset.messageId = message.id;
+      pinButton.setAttribute("aria-label", currentGroup.pinnedMessageId === message.id ? "Открепить сообщение" : "Закрепить сообщение");
+      pinButton.title = currentGroup.pinnedMessageId === message.id ? "Открепить" : "Закрепить";
+      pinButton.textContent = currentGroup.pinnedMessageId === message.id ? "📌" : "⌖";
+      actions.append(pinButton);
+    }
     wrap.append(bubble);
     if (reactions.childElementCount > 0) wrap.append(reactions);
     wrap.append(actions, meta);
     row.append(wrap);
     messagesElement.append(row);
   }
-  messagesArea.scrollTop = messagesArea.scrollHeight;
+  updatePinnedMessage(items);
+  if (!query) messagesArea.scrollTop = messagesArea.scrollHeight;
+}
+
+function updatePinnedMessage(items) {
+  const banner = document.querySelector("#pinned-message");
+  const message = currentGroup?.pinnedMessageId
+    ? items.find((item) => item.id === currentGroup.pinnedMessageId)
+    : null;
+  banner.classList.toggle("hidden", !message);
+  banner.replaceChildren();
+  if (!message) return;
+  const label = document.createElement("strong");
+  label.textContent = "Закреплено";
+  const preview = document.createElement("span");
+  preview.textContent = `${messageSenderName(message)}: ${message.text}`;
+  banner.append(label, preview);
+  banner.onclick = () => {
+    if (document.querySelector("#message-search-input").value) {
+      document.querySelector("#message-search-input").value = "";
+      renderMessages([...currentMessagesById.values()]);
+    }
+    document.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
 }
 
 function formatFileSize(size) {
@@ -904,7 +1213,9 @@ function clearPendingReply() {
 
 function prepareReply(message) {
   pendingReplyToId = message.id;
-  document.querySelector("#reply-sender").textContent = message.fromId === currentUser.id ? "Вы отвечаете себе" : `Ответ ${currentContact.name}`;
+  document.querySelector("#reply-sender").textContent = message.fromId === currentUser.id
+    ? "Вы отвечаете себе"
+    : `Ответ ${messageSenderName(message)}`;
   document.querySelector("#reply-text").textContent = message.type === "attachment"
     ? `📎 ${message.attachment.name}`
     : message.text;
@@ -913,16 +1224,18 @@ function prepareReply(message) {
 }
 
 function sendMessageReaction(messageId, emoji) {
-  if (!currentContact || !socket || socket.readyState !== WebSocket.OPEN) {
+  if ((!currentContact && !currentGroup) || !socket || socket.readyState !== WebSocket.OPEN) {
     showToast("Нет соединения с сервером");
     return;
   }
-  socket.send(JSON.stringify({
+  const payload = {
     type: "reaction",
-    toId: currentContact.id,
     messageId,
     emoji
-  }));
+  };
+  if (currentGroup) payload.groupId = currentGroup.id;
+  else payload.toId = currentContact.id;
+  socket.send(JSON.stringify(payload));
 }
 
 messagesElement.addEventListener("click", (event) => {
@@ -951,6 +1264,15 @@ messagesElement.addEventListener("click", (event) => {
     if (picker) picker.classList.add("hidden");
     const trigger = button.closest(".reaction-menu-wrap")?.querySelector("[data-message-action='toggle-reactions']");
     if (trigger) trigger.setAttribute("aria-expanded", "false");
+    return;
+  }
+  if (action === "pin" && currentGroup?.role === "owner") {
+    const messageIdToPin = currentGroup.pinnedMessageId === messageId ? null : messageId;
+    void api(`/api/groups/${encodeURIComponent(currentGroup.id)}/pin`, {
+      method: "PATCH",
+      body: JSON.stringify({ messageId: messageIdToPin })
+    }).then(() => loadGroups()).then(() => showToast(messageIdToPin ? "Сообщение закреплено" : "Сообщение откреплено"))
+      .catch((error) => showToast(error.message));
   }
 });
 
@@ -959,9 +1281,17 @@ document.querySelector("#cancel-reply").addEventListener("click", clearPendingRe
 async function selectContact(contact) {
   if (!contact) return;
   clearPendingReply();
+  currentGroup = null;
   transferStatus.classList.add("hidden");
+  document.querySelector("#message-search").classList.add("hidden");
+  document.querySelector("#message-search-input").value = "";
+  document.querySelector("#pinned-message").classList.add("hidden");
   currentContact = contact;
   updateContactHeader(contact);
+  document.querySelector("#group-settings-button").hidden = true;
+  document.querySelector("#search-messages-toggle").hidden = true;
+  document.querySelector("#file-button").disabled = false;
+  document.querySelector("#file-button").title = "Фото или видео";
   document.querySelector("#audio-call-button").disabled = false;
   document.querySelector("#video-call-button").disabled = false;
   emptyConversation.classList.add("hidden");
@@ -972,12 +1302,63 @@ async function selectContact(contact) {
   document.querySelector("#sidebar").classList.add("has-chat");
   appScreen.classList.add("chat-open");
   renderSidebar();
+  renderMessages([]);
   try {
     const result = await api(`/api/messages?with=${encodeURIComponent(contact.id)}`);
     if (currentContact?.id === contact.id) renderMessages(result.messages);
   } catch (error) {
     showToast(error.message);
   }
+}
+
+async function selectGroup(group) {
+  if (!group) return;
+  clearPendingReply();
+  currentContact = null;
+  currentGroup = group;
+  transferStatus.classList.add("hidden");
+  document.querySelector("#message-search").classList.add("hidden");
+  document.querySelector("#message-search-input").value = "";
+  document.querySelector("#group-settings-button").hidden = false;
+  document.querySelector("#search-messages-toggle").hidden = false;
+  document.querySelector("#file-button").disabled = true;
+  document.querySelector("#file-button").title = "Вложения доступны в личных чатах";
+  updateGroupHeader(group);
+  emptyConversation.classList.add("hidden");
+  messagesArea.classList.remove("hidden");
+  document.querySelector("#message-form").classList.remove("hidden");
+  document.querySelector("#composer-hint").classList.remove("hidden");
+  document.querySelector("#message-input").focus();
+  document.querySelector("#sidebar").classList.add("has-chat");
+  appScreen.classList.add("chat-open");
+  renderSidebar();
+  renderMessages([]);
+  try {
+    const result = await api(`/api/messages?group=${encodeURIComponent(group.id)}`);
+    if (currentGroup?.id === group.id) renderMessages(result.messages);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function showEmptyConversation() {
+  currentContact = null;
+  currentGroup = null;
+  emptyConversation.classList.remove("hidden");
+  messagesArea.classList.add("hidden");
+  document.querySelector("#message-form").classList.add("hidden");
+  document.querySelector("#composer-hint").classList.add("hidden");
+  document.querySelector("#group-settings-button").hidden = true;
+  document.querySelector("#search-messages-toggle").hidden = true;
+  document.querySelector("#message-search").classList.add("hidden");
+  document.querySelector("#pinned-message").classList.add("hidden");
+  document.querySelector("#audio-call-button").disabled = true;
+  document.querySelector("#video-call-button").disabled = true;
+  document.querySelector("#file-button").disabled = false;
+  document.querySelector("#chat-name").textContent = "Бурундук";
+  document.querySelector("#chat-status").textContent = "Выберите контакт, чтобы начать";
+  document.querySelector("#header-avatar").textContent = "Б";
+  renderSidebar();
 }
 
 function updateContactHeader(contact) {
@@ -988,15 +1369,47 @@ function updateContactHeader(contact) {
   setAvatarElement(document.querySelector("#header-avatar"), contact);
 }
 
+function updateGroupHeader(group) {
+  document.querySelector("#chat-name").textContent = group.name;
+  const status = document.querySelector("#chat-status");
+  status.textContent = `${group.memberCount} участников · ${group.onlineCount} в сети`;
+  status.classList.remove("online-label");
+  const avatar = document.querySelector("#header-avatar");
+  avatar.textContent = group.avatar || "👥";
+  avatar.classList.add("emoji-avatar");
+  avatar.classList.remove("online");
+  document.querySelector("#audio-call-button").disabled = group.onlineCount < 2;
+  document.querySelector("#video-call-button").disabled = group.onlineCount < 2;
+}
+
 sidebarList.addEventListener("click", (event) => {
+  const groupItem = event.target.closest("[data-group-id]");
+  if (groupItem) {
+    const group = groups.find((entry) => entry.id === groupItem.dataset.groupId);
+    if (group) void selectGroup(group);
+    return;
+  }
   const item = event.target.closest("[data-user-id]");
-  if (item) selectContact(contactById(item.dataset.userId));
+  if (item) void selectContact(contactById(item.dataset.userId));
 });
 
 document.querySelector("#chats-tab").addEventListener("click", () => switchSection("chats"));
+document.querySelector("#groups-tab").addEventListener("click", () => switchSection("groups"));
 document.querySelector("#contacts-tab").addEventListener("click", () => switchSection("contacts"));
 searchInput.addEventListener("input", renderSidebar);
-
+document.querySelector("#search-messages-toggle").addEventListener("click", () => {
+  const searchPanel = document.querySelector("#message-search");
+  searchPanel.classList.remove("hidden");
+  document.querySelector("#message-search-input").focus();
+});
+document.querySelector("#message-search-close").addEventListener("click", () => {
+  document.querySelector("#message-search").classList.add("hidden");
+  document.querySelector("#message-search-input").value = "";
+  if (currentGroup) renderMessages([...currentMessagesById.values()]);
+});
+document.querySelector("#message-search-input").addEventListener("input", () => {
+  if (currentGroup) renderMessages([...currentMessagesById.values()]);
+});
 function switchSection(section) {
   activeSection = section;
   searchInput.value = "";
@@ -1006,6 +1419,7 @@ function switchSection(section) {
 
 document.querySelector("#add-contact-button").addEventListener("click", openContactDialog);
 document.querySelector("#empty-add-contact").addEventListener("click", openContactDialog);
+document.querySelector("#create-group-button").addEventListener("click", openCreateGroupDialog);
 
 function openContactDialog() {
   document.querySelector("#contact-error").hidden = true;
@@ -1013,6 +1427,238 @@ function openContactDialog() {
   contactDialog.showModal();
   document.querySelector("#contact-username").focus();
 }
+
+function openCreateGroupDialog() {
+  const picker = document.querySelector("#create-group-members");
+  picker.replaceChildren();
+  document.querySelector("#create-group-error").hidden = true;
+  for (const contact of contacts) {
+    const label = document.createElement("label");
+    label.className = "member-choice";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = contact.id;
+    const name = document.createElement("span");
+    name.textContent = `${contact.name} · @${contact.username}`;
+    label.append(checkbox, name);
+    picker.append(label);
+  }
+  if (!contacts.length) {
+    const empty = document.createElement("p");
+    empty.className = "list-empty";
+    empty.textContent = "Сначала добавьте хотя бы один контакт.";
+    picker.append(empty);
+  }
+  document.querySelector("#create-group-form").reset();
+  document.querySelector("#create-group-dialog").showModal();
+  document.querySelector("#new-group-name").focus();
+}
+
+document.querySelector("#create-group-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const errorElement = document.querySelector("#create-group-error");
+  const memberIds = [...document.querySelectorAll("#create-group-members input:checked")].map((input) => input.value);
+  errorElement.hidden = true;
+  if (!memberIds.length) {
+    errorElement.textContent = "Выберите хотя бы одного участника.";
+    errorElement.hidden = false;
+    return;
+  }
+  try {
+    const result = await api("/api/groups", {
+      method: "POST",
+      body: JSON.stringify({
+        name: document.querySelector("#new-group-name").value,
+        description: document.querySelector("#new-group-description").value,
+        avatar: document.querySelector("#new-group-avatar").value,
+        memberIds
+      })
+    });
+    document.querySelector("#create-group-dialog").close();
+    await loadGroups();
+    activeSection = "groups";
+    await selectGroup(groups.find((group) => group.id === result.group.id) || result.group);
+    showToast("Группа создана");
+  } catch (error) {
+    errorElement.textContent = error.message;
+    errorElement.hidden = false;
+  }
+});
+
+function showGroupSettingsError(message) {
+  const errorElement = document.querySelector("#group-settings-error");
+  errorElement.textContent = message;
+  errorElement.hidden = false;
+}
+
+function renderGroupSettings() {
+  if (!currentGroup) return;
+  const group = currentGroup;
+  const isOwner = group.role === "owner";
+  document.querySelector("#group-settings-title").textContent = group.name;
+  document.querySelector("#edit-group-name").value = group.name;
+  document.querySelector("#edit-group-description").value = group.description || "";
+  document.querySelector("#edit-group-avatar").value = group.avatar || "👥";
+  document.querySelector("#group-owner-controls").hidden = !isOwner;
+  document.querySelector("#save-group-settings-button").hidden = !isOwner;
+  document.querySelector("#leave-group-button").textContent = isOwner ? "Закрыть" : "Покинуть группу";
+  document.querySelector("#group-settings-error").hidden = true;
+
+  const memberList = document.querySelector("#group-member-list");
+  memberList.replaceChildren();
+  for (const member of group.members) {
+    const row = document.createElement("div");
+    row.className = "group-member-row";
+    const name = document.createElement("span");
+    name.className = "group-member-name";
+    name.textContent = `${member.name} · @${member.username}${member.bio ? ` · ${member.bio}` : ""}`;
+    const role = document.createElement("small");
+    role.textContent = member.role === "owner" ? "владелец" : "";
+    row.append(name, role);
+    if (isOwner && member.id !== currentUser.id) {
+      const remove = document.createElement("button");
+      remove.className = "member-remove-button";
+      remove.type = "button";
+      remove.dataset.removeGroupMember = member.id;
+      remove.textContent = "Убрать";
+      row.append(remove);
+    }
+    memberList.append(row);
+  }
+
+  const availableContacts = contacts.filter((contact) => !group.members.some((member) => member.id === contact.id));
+  const addSelect = document.querySelector("#group-add-member-select");
+  addSelect.replaceChildren();
+  for (const contact of availableContacts) addSelect.add(new Option(`${contact.name} · @${contact.username}`, contact.id));
+  if (!availableContacts.length) addSelect.add(new Option("Нет доступных контактов", ""));
+  document.querySelector("#group-add-member-button").disabled = availableContacts.length === 0;
+
+  const transferSelect = document.querySelector("#transfer-owner-select");
+  transferSelect.replaceChildren();
+  for (const member of group.members.filter((item) => item.id !== currentUser.id)) {
+    transferSelect.add(new Option(`${member.name} · @${member.username}`, member.id));
+  }
+  if (transferSelect.options.length === 0) transferSelect.add(new Option("Нет других участников", ""));
+  document.querySelector("#transfer-owner-button").disabled = transferSelect.options.length === 0;
+}
+
+function openGroupSettingsDialog() {
+  if (!currentGroup) return;
+  renderGroupSettings();
+  document.querySelector("#group-settings-dialog").showModal();
+}
+
+document.querySelector("#group-settings-button").addEventListener("click", openGroupSettingsDialog);
+document.querySelector("#group-settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!currentGroup || currentGroup.role !== "owner") return;
+  const groupId = currentGroup.id;
+  try {
+    await api(`/api/groups/${encodeURIComponent(groupId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        name: document.querySelector("#edit-group-name").value,
+        description: document.querySelector("#edit-group-description").value,
+        avatar: document.querySelector("#edit-group-avatar").value
+      })
+    });
+    await loadGroups();
+    currentGroup = groups.find((group) => group.id === groupId) || currentGroup;
+    updateGroupHeader(currentGroup);
+    renderGroupSettings();
+    showToast("Настройки группы сохранены");
+  } catch (error) {
+    showGroupSettingsError(error.message);
+  }
+});
+
+document.querySelector("#group-add-member-button").addEventListener("click", async () => {
+  if (!currentGroup) return;
+  const groupId = currentGroup.id;
+  const userId = document.querySelector("#group-add-member-select").value;
+  if (!userId) return;
+  try {
+    await api(`/api/groups/${encodeURIComponent(groupId)}/members`, {
+      method: "POST",
+      body: JSON.stringify({ userId })
+    });
+    await loadGroups();
+    currentGroup = groups.find((group) => group.id === groupId) || currentGroup;
+    renderGroupSettings();
+    showToast("Участник добавлен");
+  } catch (error) {
+    showGroupSettingsError(error.message);
+  }
+});
+
+document.querySelector("#group-member-list").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-remove-group-member]");
+  if (!button || !currentGroup) return;
+  const groupId = currentGroup.id;
+  try {
+    await api(`/api/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(button.dataset.removeGroupMember)}`, {
+      method: "DELETE"
+    });
+    await loadGroups();
+    currentGroup = groups.find((group) => group.id === groupId) || null;
+    if (currentGroup) renderGroupSettings();
+    showToast("Участник удалён");
+  } catch (error) {
+    showGroupSettingsError(error.message);
+  }
+});
+
+document.querySelector("#transfer-owner-button").addEventListener("click", async () => {
+  if (!currentGroup) return;
+  const groupId = currentGroup.id;
+  const userId = document.querySelector("#transfer-owner-select").value;
+  if (!userId || !window.confirm("Передать управление группой выбранному участнику?")) return;
+  try {
+    await api(`/api/groups/${encodeURIComponent(groupId)}/owner`, {
+      method: "PATCH",
+      body: JSON.stringify({ userId })
+    });
+    await loadGroups();
+    currentGroup = groups.find((group) => group.id === groupId) || null;
+    if (currentGroup) renderGroupSettings();
+    showToast("Владение группой передано");
+  } catch (error) {
+    showGroupSettingsError(error.message);
+  }
+});
+
+document.querySelector("#delete-group-button").addEventListener("click", async () => {
+  if (!currentGroup || !window.confirm("Удалить группу и всю её историю? Это действие нельзя отменить.")) return;
+  try {
+    await api(`/api/groups/${encodeURIComponent(currentGroup.id)}`, { method: "DELETE" });
+    document.querySelector("#group-settings-dialog").close();
+    currentGroup = null;
+    await loadGroups();
+    showEmptyConversation();
+    showToast("Группа удалена");
+  } catch (error) {
+    showGroupSettingsError(error.message);
+  }
+});
+
+document.querySelector("#leave-group-button").addEventListener("click", async () => {
+  if (!currentGroup) return;
+  if (currentGroup.role === "owner") {
+    document.querySelector("#group-settings-dialog").close();
+    return;
+  }
+  if (!window.confirm("Покинуть эту группу?")) return;
+  try {
+    await api(`/api/groups/${encodeURIComponent(currentGroup.id)}/leave`, { method: "POST", body: "{}" });
+    document.querySelector("#group-settings-dialog").close();
+    currentGroup = null;
+    await loadGroups();
+    showEmptyConversation();
+    showToast("Вы покинули группу");
+  } catch (error) {
+    showGroupSettingsError(error.message);
+  }
+});
 
 document.querySelectorAll("[data-close-dialog]").forEach((button) => {
   button.addEventListener("click", () => document.querySelector(`#${button.dataset.closeDialog}`).close());
@@ -1030,6 +1676,8 @@ function openProfileDialog() {
   selectedAvatar = ANIMAL_AVATARS.includes(currentUser.avatar) ? currentUser.avatar : ANIMAL_AVATARS[0];
   document.querySelector("#profile-dialog-name").textContent = currentUser.name;
   document.querySelector("#profile-dialog-username").textContent = `@${currentUser.username}`;
+  document.querySelector("#profile-bio").value = currentUser.bio || "";
+  updateProfileBioCounter();
   const picker = document.querySelector("#animal-avatar-picker");
   picker.replaceChildren(...ANIMAL_AVATARS.map((avatar) => {
     const option = document.createElement("button");
@@ -1050,6 +1698,11 @@ function openProfileDialog() {
 }
 
 document.querySelector("#profile-open-button").addEventListener("click", openProfileDialog);
+function updateProfileBioCounter() {
+  const bio = document.querySelector("#profile-bio");
+  document.querySelector("#profile-bio-count").textContent = `${bio.value.length} / 160`;
+}
+document.querySelector("#profile-bio").addEventListener("input", updateProfileBioCounter);
 profileDialog.addEventListener("click", (event) => {
   if (event.target === profileDialog) profileDialog.close();
 });
@@ -1062,7 +1715,7 @@ document.querySelector("#profile-form").addEventListener("submit", async (event)
   try {
     const result = await api("/api/profile", {
       method: "PATCH",
-      body: JSON.stringify({ avatar: selectedAvatar })
+      body: JSON.stringify({ avatar: selectedAvatar, bio: document.querySelector("#profile-bio").value })
     });
     currentUser = result.user;
     updateProfilePresentation();
@@ -1073,7 +1726,7 @@ document.querySelector("#profile-form").addEventListener("submit", async (event)
       showToast(`Аватар сохранён, но список контактов не обновился: ${error.message}`);
       return;
     }
-    showToast("Аватар профиля обновлён");
+    showToast("Профиль обновлён");
   } catch (error) {
     errorElement.textContent = error.message;
     errorElement.hidden = false;
@@ -1109,17 +1762,15 @@ document.querySelector("#contact-form").addEventListener("submit", async (event)
 document.querySelector("#message-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const text = messageInput.value.trim();
-  if (!text || !currentContact) return;
+  if (!text || (!currentContact && !currentGroup)) return;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     showToast("Нет соединения с сервером");
     return;
   }
-  socket.send(JSON.stringify({
-    type: "message",
-    toId: currentContact.id,
-    text,
-    replyToId: pendingReplyToId
-  }));
+  const payload = currentGroup
+    ? { type: "group-message", groupId: currentGroup.id, text, replyToId: pendingReplyToId }
+    : { type: "message", toId: currentContact.id, text, replyToId: pendingReplyToId };
+  socket.send(JSON.stringify(payload));
   messageInput.value = "";
   messageInput.style.height = "auto";
   clearPendingReply();
@@ -1134,6 +1785,10 @@ document.querySelector(".emoji-button").addEventListener("click", () => {
 });
 
 document.querySelector("#file-button").addEventListener("click", () => {
+  if (currentGroup) {
+    showToast("Фото и видео сейчас доступны только в личных чатах.");
+    return;
+  }
   if (!currentContact) {
     showToast("Сначала выберите контакт");
     return;
@@ -1152,8 +1807,10 @@ fileInput.addEventListener("change", () => {
 });
 
 function sendTyping(active) {
-  if (socket?.readyState === WebSocket.OPEN && currentContact) {
-    socket.send(JSON.stringify({ type: "typing", toId: currentContact.id, active }));
+  if (socket?.readyState === WebSocket.OPEN && (currentContact || currentGroup)) {
+    socket.send(JSON.stringify(currentGroup
+      ? { type: "typing", groupId: currentGroup.id, active }
+      : { type: "typing", toId: currentContact.id, active }));
   }
 }
 
@@ -1609,6 +2266,7 @@ function connectWebSocket() {
     handleSocketMessage(payload);
   });
   socket.addEventListener("close", (event) => {
+    if (groupCall || incomingGroupCall) endGroupCall(false, true);
     if (event.code === 4001) {
       localStorage.removeItem(TOKEN_KEY);
       appScreen.classList.add("hidden");
@@ -1626,6 +2284,7 @@ function handleSocketMessage(payload) {
   if (payload.type === "ready") {
     for (const contact of contacts) contact.online = payload.online.includes(contact.id);
     renderSidebar();
+    loadGroups().catch((error) => showToast(error.message));
     return;
   }
   if (payload.type === "message") {
@@ -1662,8 +2321,56 @@ function handleSocketMessage(payload) {
     return;
   }
   if (payload.type === "reaction") {
-    if (currentContact && payload.toId === currentContact.id) loadCurrentConversation();
-    loadChats().catch((error) => showToast(error.message));
+    if ((currentContact && payload.toId === currentContact.id) || (currentGroup && payload.groupId === currentGroup.id)) {
+      loadCurrentConversation();
+    }
+    if (payload.groupId) loadGroups().catch((error) => showToast(error.message));
+    else loadChats().catch((error) => showToast(error.message));
+    return;
+  }
+  if (payload.type === "group-message") {
+    const message = payload.message;
+    const group = groups.find((entry) => entry.id === message.groupId);
+    if (message.fromId !== currentUser.id && group) {
+      const sender = group.members.find((member) => member.id === message.fromId);
+      showGroupNotification(
+        message.mentions?.includes(currentUser.id) ? `Вас упомянули · ${group.name}` : group.name,
+        `${sender?.name || "Участник"}: ${message.text.slice(0, 100)}`,
+        group.id,
+        true
+      );
+      playMessageSound();
+    }
+    if (currentGroup?.id === message.groupId) loadCurrentConversation();
+    loadGroups().catch((error) => showToast(error.message));
+    return;
+  }
+  if (payload.type === "group-updated") {
+    const index = groups.findIndex((group) => group.id === payload.group.id);
+    if (index >= 0) groups[index] = payload.group;
+    else groups.push(payload.group);
+    if (currentGroup?.id === payload.group.id) {
+      currentGroup = payload.group;
+      updateGroupHeader(currentGroup);
+      renderMessages([...currentMessagesById.values()]);
+      if (document.querySelector("#group-settings-dialog").open) renderGroupSettings();
+    }
+    renderSidebar();
+    return;
+  }
+  if (payload.type === "group-removed") {
+    groups = groups.filter((group) => group.id !== payload.groupId);
+    if (currentGroup?.id === payload.groupId) showEmptyConversation();
+    renderSidebar();
+    if (groupCall?.groupId === payload.groupId) endGroupCall(false, true);
+    return;
+  }
+  if (payload.type === "group-typing") {
+    if (currentGroup?.id === payload.groupId) {
+      const indicator = document.querySelector("#typing-indicator");
+      indicator.querySelector("label").textContent = payload.active ? "участник печатает" : "печатает";
+      indicator.hidden = !payload.active;
+    }
     return;
   }
   if (payload.type === "presence") {
@@ -1677,6 +2384,22 @@ function handleSocketMessage(payload) {
     renderSidebar();
     return;
   }
+  if (payload.type === "group-presence") {
+    const group = groups.find((entry) => entry.id === payload.groupId);
+    const member = group?.members.find((entry) => entry.id === payload.userId);
+    if (member) {
+      member.online = payload.online;
+      group.onlineCount = group.members.filter((entry) => entry.online).length;
+      if (currentGroup?.id === group.id) {
+        currentGroup = group;
+        updateGroupHeader(group);
+        document.querySelector("#audio-call-button").disabled = group.onlineCount < 2;
+        document.querySelector("#video-call-button").disabled = group.onlineCount < 2;
+      }
+      renderSidebar();
+    }
+    return;
+  }
   if (payload.type === "typing") {
     if (currentContact?.id === payload.fromId) {
       const indicator = document.querySelector("#typing-indicator");
@@ -1685,7 +2408,7 @@ function handleSocketMessage(payload) {
     return;
   }
   if (payload.type === "contacts-updated") {
-    Promise.all([loadContacts(), loadChats()]).catch((error) => showToast(error.message));
+    Promise.all([loadContacts(), loadChats(), loadGroups()]).catch((error) => showToast(error.message));
     return;
   }
   if (payload.type === "profile-updated" && payload.user && payload.user.id === currentUser?.id) {
@@ -1694,6 +2417,13 @@ function handleSocketMessage(payload) {
     return;
   }
   if (payload.type === "signal") handleCallSignal(payload);
+  if (typeof payload.type === "string" && payload.type.startsWith("group-call-")) {
+    void handleGroupCallEvent(payload).catch((error) => {
+      console.error("Не удалось обработать событие группового звонка:", error);
+      showToast("Не удалось подключиться к групповому звонку.");
+    });
+    return;
+  }
   if (payload.type === "file-signal") {
     void handleFileSignal(payload).catch((error) => {
       console.error("Не удалось обработать сигнал P2P:", error);
@@ -1702,10 +2432,23 @@ function handleSocketMessage(payload) {
       showToast("Не удалось установить соединение для передачи файла.");
     });
   }
-  if (payload.type === "error") showToast(payload.error);
+  if (payload.type === "error") {
+    showToast(payload.error);
+    if (payload.requestType === "group-call" && groupCall?.callId === payload.callId) endGroupCall(false, true);
+  }
 }
 
 async function loadCurrentConversation() {
+  if (currentGroup) {
+    const groupId = currentGroup.id;
+    try {
+      const result = await api(`/api/messages?group=${encodeURIComponent(groupId)}`);
+      if (currentGroup?.id === groupId) renderMessages(result.messages);
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
   if (!currentContact) return;
   const contactId = currentContact.id;
   try {
@@ -1749,6 +2492,14 @@ audioCallButton.addEventListener("click", () => startCall(false));
 videoCallButton.addEventListener("click", () => startCall(true));
 
 async function startCall(video) {
+  if (currentGroup) {
+    await startGroupCall(video);
+    return;
+  }
+  if (groupCall || incomingGroupCall) {
+    showToast("Сначала завершите текущий звонок.");
+    return;
+  }
   if (!currentContact || !socket || socket.readyState !== WebSocket.OPEN) {
     showToast("Нет соединения с сервером");
     return;
@@ -1821,10 +2572,348 @@ function sendSignal(toId, signal) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "signal", toId, signal }));
 }
 
+function sendGroupCallAction(action, details = {}) {
+  if (socket?.readyState !== WebSocket.OPEN) throw new Error("Нет соединения с сервером.");
+  socket.send(JSON.stringify({
+    type: "group-call",
+    groupId: groupCall?.groupId || incomingGroupCall?.groupId,
+    callId: groupCall?.callId || incomingGroupCall?.callId,
+    action,
+    ...details
+  }));
+}
+
+function prepareGroupCallDialog(group, caller = null) {
+  document.querySelector("#call-title").textContent = caller ? "Входящий групповой звонок" : group.name;
+  document.querySelector("#remote-name").textContent = caller ? `${caller.name} · ${group.name}` : group.name;
+  document.querySelector("#call-status").textContent = caller ? "Групповой звонок" : "Подключаем участников...";
+  document.querySelector("#remote-placeholder").classList.remove("hidden");
+  document.querySelector("#remote-video").classList.add("hidden");
+  document.querySelector("#local-video").classList.add("hidden");
+  document.querySelector("#group-video-grid").classList.toggle("hidden", Boolean(caller));
+  document.querySelector("#incoming-actions").hidden = !caller;
+  document.querySelector("#call-controls").hidden = Boolean(caller);
+  if (!callDialog.open) callDialog.showModal();
+}
+
+function createGroupCallTile(member, isLocal = false) {
+  const tile = document.createElement("div");
+  tile.className = "group-video-tile";
+  tile.dataset.participantId = member.id;
+  const avatar = document.createElement("span");
+  avatar.textContent = member.avatar || nameInitial(member.name);
+  const video = document.createElement("video");
+  video.autoplay = true;
+  video.playsInline = true;
+  video.muted = isLocal;
+  const name = document.createElement("strong");
+  name.textContent = isLocal ? "Вы" : member.name;
+  tile.append(avatar, video, name);
+  return tile;
+}
+
+function renderGroupCallTiles() {
+  if (!groupCall) return;
+  const grid = document.querySelector("#group-video-grid");
+  grid.replaceChildren();
+  const localMember = { id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar };
+  const localTile = createGroupCallTile(localMember, true);
+  localTile.querySelector("video").srcObject = localStream;
+  grid.append(localTile);
+  for (const member of groupCall.participants.values()) {
+    const tile = groupCall.tiles.get(member.id) || createGroupCallTile(member);
+    groupCall.tiles.set(member.id, tile);
+    grid.append(tile);
+  }
+}
+
+function makeGroupPeer(userId, offerer) {
+  if (!groupCall || groupCall.peers.has(userId)) return groupCall?.peers.get(userId);
+  const member = groupCall.participants.get(userId);
+  if (!member) return undefined;
+  const connection = new RTCPeerConnection({ iceServers });
+  const peer = { connection, pendingCandidates: [] };
+  groupCall.peers.set(userId, peer);
+  localStream?.getTracks().forEach((track) => connection.addTrack(track, localStream));
+  connection.onicecandidate = (event) => {
+    if (!event.candidate || !groupCall) return;
+    try {
+      sendGroupCallAction("signal", { toUserId: userId, signal: { kind: "candidate", candidate: event.candidate } });
+    } catch (error) {
+      showToast(error.message);
+    }
+  };
+  connection.ontrack = (event) => {
+    const tile = groupCall?.tiles.get(userId);
+    if (!tile) return;
+    const video = tile.querySelector("video");
+    video.srcObject = event.streams[0];
+    const hasVideo = event.streams[0].getVideoTracks().some((track) => track.enabled);
+    tile.querySelector("span").hidden = hasVideo;
+    if (hasVideo) void video.play().catch(() => {});
+  };
+  connection.onconnectionstatechange = () => {
+    if (connection.connectionState === "connected" && groupCall) {
+      document.querySelector("#call-status").textContent = `На связи · ${groupCall.participants.size + 1} участников`;
+    } else if (connection.connectionState === "failed") {
+      document.querySelector("#call-status").textContent = "Проблема соединения";
+      showToast(`Не удалось соединиться с ${member.name}. Возможно, потребуется TURN-сервер.`);
+    }
+  };
+  if (offerer) {
+    void (async () => {
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+      sendGroupCallAction("signal", { toUserId: userId, signal: { kind: "offer", description: connection.localDescription } });
+    })().catch((error) => {
+      console.error("Не удалось создать offer группового звонка:", error);
+      showToast("Не удалось подключить участника к звонку.");
+    });
+  }
+  return peer;
+}
+
+async function drainGroupCandidates(peer) {
+  const candidates = peer.pendingCandidates;
+  peer.pendingCandidates = [];
+  for (const candidate of candidates) await peer.connection.addIceCandidate(candidate);
+}
+
+async function startGroupCall(video) {
+  if (!currentGroup || !socket || socket.readyState !== WebSocket.OPEN) {
+    showToast("Нет соединения с сервером");
+    return;
+  }
+  if (currentGroup.onlineCount < 2) {
+    showToast("Для звонка нужен ещё хотя бы один участник в сети.");
+    return;
+  }
+  if (groupCall || incomingGroupCall || peerConnection || incomingCall) {
+    showToast("Сначала завершите текущий звонок.");
+    return;
+  }
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    showToast("Групповые звонки доступны на localhost или сайте с HTTPS.");
+    return;
+  }
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video });
+    groupCall = {
+      groupId: currentGroup.id,
+      callId: crypto.randomUUID(),
+      isStarter: true,
+      video,
+      participants: new Map(),
+      peers: new Map(),
+      tiles: new Map()
+    };
+    document.querySelector("#local-video").srcObject = localStream;
+    prepareGroupCallDialog(currentGroup);
+    renderGroupCallTiles();
+    sendGroupCallAction("start", { callId: groupCall.callId, video });
+    startCallSound();
+    callTimer = setTimeout(() => {
+      if (groupCall) {
+        showToast("Никто не ответил на групповой звонок");
+        endGroupCall(true);
+      }
+    }, 45_000);
+  } catch (error) {
+    endGroupCall(false, true);
+    showToast(error.name === "NotAllowedError" ? "Разрешите доступ к микрофону и камере." : error.message);
+  }
+}
+
+function showIncomingGroupCall(payload) {
+  if (groupCall || incomingGroupCall || peerConnection || incomingCall) {
+    sendGroupCallAction("decline", {
+      groupId: payload.groupId,
+      callId: payload.callId
+    });
+    return;
+  }
+  const group = groups.find((entry) => entry.id === payload.groupId);
+  if (!group) return;
+  incomingGroupCall = { groupId: payload.groupId, callId: payload.callId, from: payload.from, video: payload.video };
+  prepareGroupCallDialog(group, payload.from);
+  startCallSound();
+  showGroupNotification(
+    `Входящий групповой звонок · ${group.name}`,
+    `${payload.from.name} приглашает присоединиться`,
+    group.id,
+    true
+  );
+  callTimer = setTimeout(() => {
+    if (incomingGroupCall) declineGroupCall(false);
+  }, 45_000);
+}
+
+async function answerGroupCall() {
+  if (!incomingGroupCall) return;
+  const call = incomingGroupCall;
+  stopCallSound();
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    declineGroupCall(true);
+    showToast("Для звонков откройте сайт через HTTPS или localhost.");
+    return;
+  }
+  try {
+    clearTimeout(callTimer);
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.video });
+    groupCall = {
+      groupId: call.groupId,
+      callId: call.callId,
+      isStarter: false,
+      video: call.video,
+      participants: new Map(),
+      peers: new Map(),
+      tiles: new Map()
+    };
+    incomingGroupCall = null;
+    const group = groups.find((entry) => entry.id === call.groupId) || { name: "Группа" };
+    prepareGroupCallDialog(group);
+    renderGroupCallTiles();
+    sendGroupCallAction("join");
+  } catch (error) {
+    if (incomingGroupCall) declineGroupCall(true);
+    else endGroupCall(false, true);
+    showToast(error.name === "NotAllowedError" ? "Разрешите доступ к микрофону и камере." : "Не удалось ответить на звонок.");
+  }
+}
+
+function declineGroupCall(notify = true) {
+  clearTimeout(callTimer);
+  stopCallSound();
+  if (notify && incomingGroupCall && socket?.readyState === WebSocket.OPEN) {
+    try {
+      sendGroupCallAction("decline");
+    } catch (error) {
+      console.warn("Не удалось отклонить групповой звонок:", error);
+    }
+  }
+  incomingGroupCall = null;
+  resetCallDialog();
+}
+
+function resetCallDialog() {
+  clearTimeout(callTimer);
+  callTimer = null;
+  stopCallSound();
+  document.querySelector("#local-video").srcObject = null;
+  document.querySelector("#remote-video").srcObject = null;
+  document.querySelector("#local-video").classList.remove("hidden");
+  document.querySelector("#remote-video").classList.remove("hidden");
+  document.querySelector("#group-video-grid").classList.add("hidden");
+  document.querySelector("#group-video-grid").replaceChildren();
+  document.querySelector("#remote-placeholder").classList.remove("hidden");
+  document.querySelector("#call-controls").hidden = false;
+  document.querySelector("#incoming-actions").hidden = true;
+  document.querySelector("#mute-button").classList.remove("off");
+  document.querySelector("#camera-button").classList.remove("off");
+  document.querySelector("#mute-button").setAttribute("aria-label", "Выключить микрофон");
+  document.querySelector("#camera-button").setAttribute("aria-label", "Выключить камеру");
+  if (callDialog.open) callDialog.close();
+}
+
+function endGroupCall(notifyPeer = true, remoteEnded = false) {
+  clearTimeout(callTimer);
+  stopCallSound();
+  if (notifyPeer && socket?.readyState === WebSocket.OPEN) {
+    try {
+      if (incomingGroupCall) sendGroupCallAction("decline");
+      else if (groupCall) sendGroupCallAction(groupCall.isStarter ? "end" : "leave");
+    } catch (error) {
+      console.warn("Не удалось завершить групповой звонок на сервере:", error);
+    }
+  }
+  if (groupCall) {
+    for (const peer of groupCall.peers.values()) peer.connection.close();
+  }
+  localStream?.getTracks().forEach((track) => track.stop());
+  localStream = null;
+  groupCall = null;
+  incomingGroupCall = null;
+  muted = false;
+  cameraOff = false;
+  resetCallDialog();
+  if (remoteEnded) return;
+}
+
+async function handleGroupCallEvent(payload) {
+  if (payload.type === "group-call-incoming") {
+    showIncomingGroupCall(payload);
+    return;
+  }
+  if (payload.type === "group-call-started") {
+    return;
+  }
+  if (payload.type === "group-call-joined" && groupCall?.callId === payload.callId) {
+    clearTimeout(callTimer);
+    stopCallSound();
+    for (const participant of payload.participants) {
+      groupCall.participants.set(participant.id, participant);
+      groupCall.tiles.set(participant.id, createGroupCallTile(participant));
+    }
+    renderGroupCallTiles();
+    for (const participant of payload.participants) makeGroupPeer(participant.id, true);
+    document.querySelector("#call-status").textContent = "Подключаем участников...";
+    return;
+  }
+  if (payload.type === "group-call-participant-joined" && groupCall?.callId === payload.callId) {
+    clearTimeout(callTimer);
+    stopCallSound();
+    groupCall.participants.set(payload.participant.id, payload.participant);
+    groupCall.tiles.set(payload.participant.id, createGroupCallTile(payload.participant));
+    renderGroupCallTiles();
+    return;
+  }
+  if (payload.type === "group-call-signal" && groupCall?.callId === payload.callId) {
+    const fromId = payload.fromId;
+    let peer = groupCall.peers.get(fromId);
+    if (payload.signal.kind === "offer" && !peer) peer = makeGroupPeer(fromId, false);
+    if (!peer) return;
+    if (payload.signal.kind === "offer") {
+      await peer.connection.setRemoteDescription(payload.signal.description);
+      await drainGroupCandidates(peer);
+      const answer = await peer.connection.createAnswer();
+      await peer.connection.setLocalDescription(answer);
+      sendGroupCallAction("signal", { toUserId: fromId, signal: { kind: "answer", description: peer.connection.localDescription } });
+    } else if (payload.signal.kind === "answer") {
+      await peer.connection.setRemoteDescription(payload.signal.description);
+      await drainGroupCandidates(peer);
+    } else if (payload.signal.kind === "candidate") {
+      if (peer.connection.remoteDescription) await peer.connection.addIceCandidate(payload.signal.candidate);
+      else peer.pendingCandidates.push(payload.signal.candidate);
+    }
+    return;
+  }
+  if (payload.type === "group-call-participant-left" && groupCall?.callId === payload.callId) {
+    groupCall.peers.get(payload.userId)?.connection.close();
+    groupCall.peers.delete(payload.userId);
+    groupCall.participants.delete(payload.userId);
+    groupCall.tiles.delete(payload.userId);
+    renderGroupCallTiles();
+    document.querySelector("#call-status").textContent = `На связи · ${groupCall.participants.size + 1} участников`;
+    return;
+  }
+  if (payload.type === "group-call-declined" && groupCall?.callId === payload.callId) {
+    showToast(`${payload.user.name} отклонил(а) приглашение`);
+    return;
+  }
+  if (payload.type === "group-call-ended" && groupCall?.callId === payload.callId) {
+    endGroupCall(false, true);
+    return;
+  }
+  if (payload.type === "group-call-ended" && incomingGroupCall?.callId === payload.callId) {
+    declineGroupCall(false);
+    showToast("Групповой звонок уже завершён");
+  }
+}
+
 async function handleCallSignal(payload) {
   const { signal, from } = payload;
   if (signal.kind === "offer") {
-    if (peerConnection || incomingCall || activeCallPeer) {
+    if (peerConnection || incomingCall || activeCallPeer || groupCall || incomingGroupCall) {
       sendSignal(from.id, { kind: "hangup" });
       return;
     }
@@ -1885,6 +2974,10 @@ async function drainCandidates() {
 }
 
 document.querySelector("#answer-call-button").addEventListener("click", async () => {
+  if (incomingGroupCall) {
+    await answerGroupCall();
+    return;
+  }
   if (!incomingCall) return;
   const call = incomingCall;
   stopCallSound();
@@ -1922,12 +3015,22 @@ document.querySelector("#answer-call-button").addEventListener("click", async ()
   }
 });
 
-document.querySelector("#decline-call-button").addEventListener("click", () => endCall(true));
-document.querySelector("#end-call-button").addEventListener("click", () => endCall(true));
-document.querySelector("#close-call-button").addEventListener("click", () => endCall(true));
+document.querySelector("#decline-call-button").addEventListener("click", () => {
+  if (incomingGroupCall) declineGroupCall(true);
+  else endCall(true);
+});
+document.querySelector("#end-call-button").addEventListener("click", () => {
+  if (groupCall || incomingGroupCall) endGroupCall(true);
+  else endCall(true);
+});
+document.querySelector("#close-call-button").addEventListener("click", () => {
+  if (groupCall || incomingGroupCall) endGroupCall(true);
+  else endCall(true);
+});
 callDialog.addEventListener("cancel", (event) => {
   event.preventDefault();
-  endCall(true);
+  if (groupCall || incomingGroupCall) endGroupCall(true);
+  else endCall(true);
 });
 
 function endCall(notifyPeer = true) {
