@@ -38,8 +38,43 @@ let callSoundTimer = null;
 let callSoundTimeouts = [];
 let audioContext = null;
 let toastAction = null;
+let pushNotificationsConfigured = false;
+let pendingNotificationContactId = new URLSearchParams(location.search).get("contact");
 let notificationsEnabled = localStorage.getItem("burunduk-notifications") !== "false";
 let soundEnabled = localStorage.getItem("burunduk-sound") !== "false";
+const serviceWorkerReady = "serviceWorker" in navigator
+  ? navigator.serviceWorker.register("/service-worker.js")
+    .then(() => navigator.serviceWorker.ready)
+    .catch((error) => {
+      console.warn("Не удалось зарегистрировать Service Worker:", error);
+      return null;
+    })
+  : Promise.resolve(null);
+
+async function getServiceWorkerRegistration() {
+  let timeoutId;
+  try {
+    return await Promise.race([
+      serviceWorkerReady,
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => {
+          console.warn("Service Worker не активировался вовремя.");
+          resolve(null);
+        }, 6000);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (event.data?.type === "notification-click" && typeof event.data.contactId === "string") {
+      openNotificationContact(event.data.contactId);
+    }
+  });
+}
 
 const theme = localStorage.getItem(THEME_KEY) || "dark";
 document.body.dataset.theme = theme;
@@ -77,23 +112,129 @@ function showToast(message, action = null) {
   }, 7000);
 }
 
-function showNotification(title, body, contactId) {
+function showNotification(title, body, contactId, serverPushWillNotify = false) {
   if (!notificationsEnabled) return;
   const contact = contactById(contactId);
   showToast(`${title}: ${body}`, () => contact && focusContact(contact));
 
-  if (document.hidden && "Notification" in window && Notification.permission === "granted") {
+  void showSystemNotification(title, body, contactId, serverPushWillNotify);
+}
+
+async function showSystemNotification(title, body, contactId, serverPushWillNotify) {
+  if (!document.hidden || !("Notification" in window) || Notification.permission !== "granted") return;
+  if (serverPushWillNotify && pushNotificationsConfigured) return;
+  const options = {
+    body,
+    tag: `burunduk-${contactId}`,
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
+    vibrate: [180, 80, 180],
+    data: { contactId }
+  };
+  try {
+    const registration = await getServiceWorkerRegistration();
+    if (registration) {
+      await registration.showNotification(title, options);
+      return;
+    }
+    const notification = new Notification(title, options);
+    notification.onclick = () => {
+      notification.close();
+      window.focus();
+      const contact = contactById(contactId);
+      if (contact) focusContact(contact);
+    };
+  } catch (error) {
+    console.warn("Системное уведомление недоступно:", error);
+  }
+}
+
+function decodeApplicationServerKey(value) {
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+  const raw = atob(padded);
+  return Uint8Array.from(raw, (character) => character.charCodeAt(0));
+}
+
+async function syncPushSubscription() {
+  if (!notificationsEnabled || !currentUser || !("Notification" in window) || Notification.permission !== "granted") return false;
+  try {
+    const registration = await getServiceWorkerRegistration();
+    if (!registration || !("PushManager" in window)) return false;
+    const { publicKey } = await api("/api/push/public-key");
+    let subscription = await registration.pushManager.getSubscription();
+    if (!subscription) {
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: decodeApplicationServerKey(publicKey)
+      });
+    }
+    await api("/api/push/subscribe", {
+      method: "POST",
+      body: JSON.stringify({ subscription: subscription.toJSON() })
+    });
+    pushNotificationsConfigured = true;
+    return true;
+  } catch (error) {
+    pushNotificationsConfigured = false;
+    console.warn("Не удалось включить push-уведомления:", error);
+    return false;
+  }
+}
+
+async function enableSystemNotifications() {
+  if (!("Notification" in window)) {
+    showToast("Всплывающие уведомления включены. Системные уведомления браузер не поддерживает.");
+    return;
+  }
+  let permission = Notification.permission;
+  if (permission === "default") {
     try {
-      const notification = new Notification(title, { body, tag: `burunduk-${contactId}` });
-      notification.onclick = () => {
-        notification.close();
-        window.focus();
-        if (contact) focusContact(contact);
-      };
+      permission = await Notification.requestPermission();
     } catch (error) {
-      console.warn("Системное уведомление недоступно:", error);
+      console.warn("Не удалось запросить разрешение на уведомления:", error);
+      showToast("Всплывающие уведомления приложения включены");
+      return;
     }
   }
+  updateNotificationControls();
+  if (permission !== "granted") {
+    showToast("Всплывающие уведомления приложения включены. Разрешите системные в настройках браузера.");
+    return;
+  }
+  const pushEnabled = await syncPushSubscription();
+  showToast(pushEnabled
+    ? "Системные уведомления включены, в том числе в фоне"
+    : "Всплывающие уведомления работают. Для системных нужен HTTPS и поддержка Push браузером.");
+}
+
+async function removePushSubscription(token = localStorage.getItem(TOKEN_KEY)) {
+  pushNotificationsConfigured = false;
+  try {
+    const registration = await getServiceWorkerRegistration();
+    const subscription = await registration?.pushManager?.getSubscription();
+    if (!subscription) return;
+    await subscription.unsubscribe();
+    if (token) {
+      await api("/api/push/subscribe", {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ endpoint: subscription.endpoint })
+      });
+    }
+  } catch (error) {
+    console.warn("Не удалось отключить push-уведомления:", error);
+  }
+}
+
+function openNotificationContact(contactId) {
+  const contact = contactById(contactId);
+  if (contact) {
+    pendingNotificationContactId = null;
+    focusContact(contact);
+    return;
+  }
+  pendingNotificationContactId = contactId;
 }
 
 function focusContact(contact) {
@@ -115,6 +256,13 @@ function updateNotificationControls() {
   button.classList.toggle("is-on", notificationsEnabled);
   button.setAttribute("aria-pressed", String(notificationsEnabled));
   button.querySelector("span:last-child").textContent = notificationsEnabled ? "Уведомления" : "Без уведомлений";
+  button.title = !notificationsEnabled
+    ? "Включить уведомления"
+    : !("Notification" in window) || Notification.permission === "denied"
+      ? "Системные уведомления нужно разрешить в настройках браузера"
+      : Notification.permission === "default"
+        ? "Нажмите, чтобы настроить системные уведомления"
+        : "Системные уведомления включены";
 }
 
 function unlockSound() {
@@ -212,29 +360,23 @@ document.querySelector("#sound-toggle").addEventListener("click", () => {
 });
 
 document.querySelector("#notification-toggle").addEventListener("click", async () => {
+  const hasSavedPreference = localStorage.getItem("burunduk-notifications") !== null;
+  if (!hasSavedPreference && notificationsEnabled) {
+    localStorage.setItem("burunduk-notifications", "true");
+    updateNotificationControls();
+    await enableSystemNotifications();
+    return;
+  }
+
   notificationsEnabled = !notificationsEnabled;
   localStorage.setItem("burunduk-notifications", String(notificationsEnabled));
   updateNotificationControls();
   if (!notificationsEnabled) {
+    void removePushSubscription();
     showToast("Уведомления выключены");
     return;
   }
-  if ("Notification" in window && Notification.permission === "default") {
-    try {
-      const permission = await Notification.requestPermission();
-      showToast(permission === "granted"
-        ? "Всплывающие и системные уведомления включены"
-        : "Всплывающие уведомления в приложении включены");
-    } catch {
-      showToast("Всплывающие уведомления в приложении включены");
-    }
-    return;
-  }
-  if ("Notification" in window && Notification.permission === "denied") {
-    showToast("В приложении включены. Для системных разрешите уведомления в настройках сайта.");
-    return;
-  }
-  showToast("Всплывающие уведомления включены");
+  await enableSystemNotifications();
 });
 
 updateSoundControls();
@@ -318,6 +460,17 @@ async function enterMessenger() {
   document.querySelector("#profile-username").textContent = `@${currentUser.username}`;
   document.querySelector("#profile-avatar").textContent = currentUser.name.trim().charAt(0).toLocaleUpperCase("ru");
   await Promise.all([loadContacts(), loadChats()]);
+  if (pendingNotificationContactId) {
+    const contact = contactById(pendingNotificationContactId);
+    if (contact) {
+      pendingNotificationContactId = null;
+      history.replaceState(null, "", location.pathname);
+      await selectContact(contact);
+    }
+  }
+  if (notificationsEnabled && "Notification" in window && Notification.permission === "granted") {
+    await syncPushSubscription();
+  }
   try {
     const config = await api("/api/rtc-config");
     iceServers = config.iceServers;
@@ -619,7 +772,7 @@ function handleSocketMessage(payload) {
       const sender = contactById(message.fromId);
       const senderName = sender?.name || "Новый контакт";
       const preview = message.text.length > 120 ? `${message.text.slice(0, 117)}…` : message.text;
-      showNotification(`Сообщение от ${senderName}`, preview, message.fromId);
+      showNotification(`Сообщение от ${senderName}`, preview, message.fromId, true);
       playMessageSound();
     }
     if (currentContact && (message.fromId === currentContact.id || message.toId === currentContact.id)) {
@@ -667,6 +820,7 @@ async function loadCurrentConversation() {
 
 document.querySelector("#back-button").addEventListener("click", () => appScreen.classList.remove("chat-open"));
 document.querySelector("#logout-button").addEventListener("click", () => {
+  void removePushSubscription();
   localStorage.removeItem(TOKEN_KEY);
   clearTimeout(reconnectTimer);
   socket?.close();

@@ -4,6 +4,7 @@ import { dirname, extname, join } from "node:path";
 import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import webPush from "web-push";
 import { WebSocketServer, WebSocket } from "ws";
 
 const scrypt = promisify(scryptCallback);
@@ -11,14 +12,39 @@ const PORT = Number(process.env.PORT) || 3000;
 const ROOT_DIR = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(ROOT_DIR, "data");
 const DATA_FILE = join(DATA_DIR, "messenger.json");
+const VAPID_KEYS_FILE = join(DATA_DIR, "vapid-keys.json");
 const CLIENT_FILES = new Map([
   ["/", "Index.html"],
   ["/Index.html", "Index.html"],
   ["/style.css", "style.css"],
-  ["/app.js", "app.js"]
+  ["/app.js", "app.js"],
+  ["/service-worker.js", "service-worker.js"],
+  ["/manifest.webmanifest", "manifest.webmanifest"],
+  ["/icon.svg", "icon.svg"],
+  ["/icon-192.png", "icon-192.png"],
+  ["/icon-512.png", "icon-512.png"],
+  ["/apple-touch-icon.png", "apple-touch-icon.png"]
 ]);
 
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+
+const envVapidKeys = process.env.VAPID_PUBLIC_KEY || process.env.VAPID_PRIVATE_KEY;
+if (envVapidKeys && (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY)) {
+  throw new Error("Для Web Push задайте одновременно VAPID_PUBLIC_KEY и VAPID_PRIVATE_KEY.");
+}
+const vapidKeys = envVapidKeys
+  ? { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY }
+  : existsSync(VAPID_KEYS_FILE)
+    ? JSON.parse(readFileSync(VAPID_KEYS_FILE, "utf8"))
+    : webPush.generateVAPIDKeys();
+if (!envVapidKeys && !existsSync(VAPID_KEYS_FILE)) {
+  writeFileSync(VAPID_KEYS_FILE, JSON.stringify(vapidKeys), { mode: 0o600 });
+}
+webPush.setVapidDetails(
+  process.env.VAPID_SUBJECT || "mailto:admin@localhost",
+  vapidKeys.publicKey,
+  vapidKeys.privateKey
+);
 
 let database = existsSync(DATA_FILE)
   ? JSON.parse(readFileSync(DATA_FILE, "utf8"))
@@ -88,6 +114,29 @@ function sendToUser(userId, payload) {
   }
 }
 
+function sendPushToUser(userId, payload) {
+  const user = findUser(userId);
+  if (!user || !Array.isArray(user.pushSubscriptions) || user.pushSubscriptions.length === 0) return;
+  const subscriptions = [...user.pushSubscriptions];
+  void Promise.allSettled(subscriptions.map((subscription) =>
+    Promise.resolve().then(() => webPush.sendNotification(subscription, JSON.stringify(payload), { TTL: 120 }))
+  )).then((results) => {
+    const expiredEndpoints = new Set();
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") return;
+      if (result.reason?.statusCode === 404 || result.reason?.statusCode === 410) {
+        expiredEndpoints.add(subscriptions[index].endpoint);
+      } else {
+        console.warn("Web Push send failed:", result.reason.statusCode || result.reason.message);
+      }
+    });
+    if (expiredEndpoints.size > 0) {
+      user.pushSubscriptions = user.pushSubscriptions.filter((subscription) => !expiredEndpoints.has(subscription.endpoint));
+      saveDatabase();
+    }
+  }).catch((error) => console.error("Web Push delivery failed:", error));
+}
+
 function isContact(user, otherId) {
   return user.contacts.includes(otherId);
 }
@@ -135,7 +184,8 @@ async function handleApi(request, response, url) {
       name,
       salt: salt.toString("hex"),
       passwordHash: passwordHash.toString("hex"),
-      contacts: []
+      contacts: [],
+      pushSubscriptions: []
     };
     database.users.push(user);
     saveDatabase();
@@ -184,6 +234,70 @@ async function handleApi(request, response, url) {
       });
     }
     jsonResponse(response, 200, { iceServers });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/push/public-key") {
+    jsonResponse(response, 200, { publicKey: vapidKeys.publicKey });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/push/subscribe") {
+    const body = await readBody(request);
+    const subscription = body.subscription;
+    const endpoint = typeof subscription?.endpoint === "string" ? subscription.endpoint : "";
+    const keys = subscription?.keys;
+    let endpointUrl;
+    try {
+      endpointUrl = new URL(endpoint);
+    } catch {
+      jsonResponse(response, 400, { error: "Некорректная push-подписка." });
+      return;
+    }
+    const hostname = endpointUrl.hostname.toLowerCase();
+    const supportedPushHost = hostname === "fcm.googleapis.com" ||
+      hostname === "updates.push.services.mozilla.com" ||
+      hostname === "push.services.mozilla.com" ||
+      hostname === "web.push.apple.com" ||
+      hostname.endsWith(".notify.windows.com");
+    if (
+      endpoint.length > 2048 ||
+      endpointUrl.protocol !== "https:" ||
+      !supportedPushHost ||
+      typeof keys?.p256dh !== "string" ||
+      keys.p256dh.length > 256 ||
+      typeof keys.auth !== "string" ||
+      keys.auth.length > 256
+    ) {
+      jsonResponse(response, 400, { error: "Некорректная push-подписка." });
+      return;
+    }
+
+    const subscriptions = Array.isArray(user.pushSubscriptions) ? user.pushSubscriptions : [];
+    const existingIndex = subscriptions.findIndex((item) => item.endpoint === endpoint);
+    const savedSubscription = { endpoint, keys: { p256dh: keys.p256dh, auth: keys.auth } };
+    if (existingIndex < 0 && subscriptions.length >= 10) {
+      jsonResponse(response, 429, { error: "Достигнут лимит устройств для уведомлений." });
+      return;
+    }
+    if (existingIndex < 0) subscriptions.push(savedSubscription);
+    else subscriptions[existingIndex] = savedSubscription;
+    user.pushSubscriptions = subscriptions;
+    saveDatabase();
+    jsonResponse(response, 201, { subscribed: true });
+    return;
+  }
+
+  if (request.method === "DELETE" && url.pathname === "/api/push/subscribe") {
+    const body = await readBody(request);
+    const endpoint = typeof body.endpoint === "string" ? body.endpoint : "";
+    if (!Array.isArray(user.pushSubscriptions) || !endpoint) {
+      jsonResponse(response, 200, { subscribed: false });
+      return;
+    }
+    user.pushSubscriptions = user.pushSubscriptions.filter((item) => item.endpoint !== endpoint);
+    saveDatabase();
+    jsonResponse(response, 200, { subscribed: false });
     return;
   }
 
@@ -270,12 +384,23 @@ const server = createServer(async (request, response) => {
     response.end("Not found");
     return;
   }
-  const contentTypes = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8" };
-  response.writeHead(200, {
+  const contentTypes = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png"
+  };
+  const headers = {
     "Content-Type": contentTypes[extname(filename)],
     "Cache-Control": "no-cache",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "same-origin"
+  };
+  if (filename === "service-worker.js") headers["Service-Worker-Allowed"] = "/";
+  response.writeHead(200, {
+    ...headers
   });
   createReadStream(join(ROOT_DIR, filename)).pipe(response);
 });
@@ -352,6 +477,12 @@ webSocketServer.on("connection", (webSocket) => {
       saveDatabase();
       sendToUser(user.id, { type: "message", message });
       sendToUser(recipient.id, { type: "message", message });
+      sendPushToUser(recipient.id, {
+        title: `Сообщение от ${user.name}`,
+        body: message.text.slice(0, 120),
+        contactId: user.id,
+        tag: `burunduk-${user.id}`
+      });
       return;
     }
 

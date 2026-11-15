@@ -187,7 +187,7 @@ body[data-theme="light"] .auth-art { background: radial-gradient(ellipse at 52% 
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .secondary-button { min-height: 40px; padding: 0 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-raised); color: var(--muted); font-size: 10px; }
 .dialog-actions .primary-button { min-height: 40px; }
-.toast { position: fixed; z-index: 10; right: 20px; bottom: 19px; max-width: min(390px, calc(100vw - 40px)); padding: 11px 15px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-raised); color: var(--ink); box-shadow: var(--shadow); font-size: 11px; opacity: 0; pointer-events: none; transform: translateY(7px); transition: opacity .2s, transform .2s; text-align: left; }
+.toast { position: fixed; z-index: 10; right: 20px; bottom: calc(19px + env(safe-area-inset-bottom, 0px)); max-width: min(390px, calc(100vw - 40px)); padding: 11px 15px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-raised); color: var(--ink); box-shadow: var(--shadow); font-size: 11px; opacity: 0; pointer-events: none; transform: translateY(7px); transition: opacity .2s, transform .2s; text-align: left; }
 .toast.actionable { cursor: pointer; pointer-events: auto; }
 .toast.show { opacity: 1; transform: translateY(0); }
 
@@ -237,7 +237,8 @@ body[data-theme="light"] .auth-art { background: radial-gradient(ellipse at 52% 
   .composer { margin-right: 10px; margin-left: 10px; }
   .bubble-wrap { max-width: 84%; }
   .video-stage { min-height: 240px; }
-  .toast { right: 12px; bottom: 12px; max-width: calc(100vw - 24px); }
+  .toast { right: max(12px, env(safe-area-inset-right, 0px)); bottom: calc(12px + env(safe-area-inset-bottom, 0px)); left: max(12px, env(safe-area-inset-left, 0px)); max-width: none; }
+  .call-toast { right: 12px; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); left: 12px; }
 }
 
 @media (max-height: 620px) and (min-width: 561px) {
@@ -247,9 +248,20 @@ body[data-theme="light"] .auth-art { background: radial-gradient(ellipse at 52% 
 }
 
 @media (max-height: 700px) and (min-width: 761px) {
-  .auth-card { padding-top: 24px; padding-bottom: 20px; }
-  .auth-intro { margin-top: 36px; margin-bottom: 20px; }
+  .auth-card { padding-top: 16px; padding-bottom: 14px; }
+  .auth-intro { margin-top: 20px; margin-bottom: 12px; }
+  .auth-intro h1 { margin-top: 9px; margin-bottom: 8px; }
+  .auth-form { gap: 10px; margin-top: 12px; }
+  .form-field > input, .input-with-prefix { height: 39px; }
+  .auth-note { margin-top: 10px; }
   .auth-screen { min-height: min(620px, calc(100vh - 24px)); }
+}
+
+@media (max-height: 420px) {
+  .call-dialog { padding: 14px; }
+  .call-heading { margin-bottom: 8px; }
+  .video-stage { min-height: 100px; }
+  .incoming-actions, .call-controls { margin-top: 10px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
