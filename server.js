@@ -521,6 +521,17 @@ webSocketServer.on("connection", (webSocket) => {
         webSocket.send(JSON.stringify({ type: "error", error: "Сигнал звонка не прошёл проверку." }));
         return;
       }
+      if (signal.kind === "offer") {
+        const callType = signal.video ? "видеозвонок" : "аудиозвонок";
+        sendPushToUser(target.id, {
+          title: `Входящий ${callType}`,
+          body: `${user.name} звонит вам. Откройте чат, чтобы перезвонить.`,
+          contactId: user.id,
+          type: "call",
+          callType: signal.video ? "video" : "audio",
+          tag: `burunduk-call-${user.id}-${randomUUID()}`
+        });
+      }
       sendToUser(target.id, { type: "signal", from: publicUser(user), signal });
     }
   });

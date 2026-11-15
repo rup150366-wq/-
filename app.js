@@ -44,14 +44,16 @@ let pushNotificationsConfigured = false;
 let pushSetupIssue = "";
 let serviceWorkerReady = null;
 let selectedAvatar = null;
-let pendingNotificationContactId = new URLSearchParams(location.search).get("contact");
+const initialUrl = new URLSearchParams(location.search);
+let pendingNotificationContactId = initialUrl.get("contact");
+let pendingMissedCallNotification = initialUrl.get("missedCall") === "1";
 let notificationsEnabled = localStorage.getItem("burunduk-notifications") !== "false";
 let soundEnabled = localStorage.getItem("burunduk-sound") !== "false";
 
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return Promise.resolve(null);
   if (!serviceWorkerReady) {
-    serviceWorkerReady = navigator.serviceWorker.register("/service-worker.js?v=2", { scope: "/" })
+    serviceWorkerReady = navigator.serviceWorker.register("/service-worker.js?v=3", { scope: "/" })
       .then(() => navigator.serviceWorker.ready)
       .catch((error) => {
         console.warn("Не удалось зарегистрировать Service Worker:", error);
@@ -84,7 +86,7 @@ async function getServiceWorkerRegistration() {
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.addEventListener("message", (event) => {
     if (event.data?.type === "notification-click" && typeof event.data.contactId === "string") {
-      openNotificationContact(event.data.contactId);
+      openNotificationContact(event.data.contactId, event.data.notificationType);
     }
   });
 }
@@ -262,14 +264,18 @@ async function removePushSubscription(token = localStorage.getItem(TOKEN_KEY)) {
   }
 }
 
-function openNotificationContact(contactId) {
+function openNotificationContact(contactId, notificationType = "message") {
   const contact = contactById(contactId);
   if (contact) {
     pendingNotificationContactId = null;
     focusContact(contact);
+    if (notificationType === "call" && !incomingCall) {
+      showToast("Звонок мог завершиться. Вы можете перезвонить из чата.");
+    }
     return;
   }
   pendingNotificationContactId = contactId;
+  pendingMissedCallNotification = notificationType === "call";
 }
 
 function focusContact(contact) {
@@ -499,8 +505,11 @@ async function enterMessenger() {
     const contact = contactById(pendingNotificationContactId);
     if (contact) {
       pendingNotificationContactId = null;
+      const missedCallNotification = pendingMissedCallNotification;
+      pendingMissedCallNotification = false;
       history.replaceState(null, "", location.pathname);
       await selectContact(contact);
+      if (missedCallNotification) showToast("Звонок пропущен. Вы можете перезвонить из чата.");
     }
   }
   if (notificationsEnabled && "Notification" in window && Notification.permission === "granted") {
@@ -1066,7 +1075,12 @@ async function handleCallSignal(payload) {
     document.querySelector("#call-controls").hidden = true;
     document.querySelector("#remote-placeholder").classList.remove("hidden");
     callDialog.showModal();
-    showNotification(`Входящий звонок от ${from.name}`, signal.video ? "Видеозвонок" : "Аудиозвонок", from.id);
+    showNotification(
+      `Входящий звонок от ${from.name}`,
+      signal.video ? "Видеозвонок" : "Аудиозвонок",
+      from.id,
+      true
+    );
     startCallSound();
     callTimer = setTimeout(() => {
       if (incomingCall) {
