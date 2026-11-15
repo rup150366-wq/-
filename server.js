@@ -13,6 +13,7 @@ const ROOT_DIR = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(ROOT_DIR, "data");
 const DATA_FILE = join(DATA_DIR, "messenger.json");
 const VAPID_KEYS_FILE = join(DATA_DIR, "vapid-keys.json");
+const PROFILE_AVATARS = new Set(["🐿️", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐸", "🐵", "🐰", "🦝", "🦉", "🦔", "🐹", "🐶", "🐱", "🐧", "🐤"]);
 const CLIENT_FILES = new Map([
   ["/", "Index.html"],
   ["/Index.html", "Index.html"],
@@ -127,7 +128,7 @@ function sendPushToUser(userId, payload) {
       if (result.reason?.statusCode === 404 || result.reason?.statusCode === 410) {
         expiredEndpoints.add(subscriptions[index].endpoint);
       } else {
-        console.warn("Web Push send failed:", result.reason.statusCode || result.reason.message);
+        console.warn("Web Push send failed:", result.reason?.statusCode || result.reason?.message || String(result.reason));
       }
     });
     if (expiredEndpoints.size > 0) {
@@ -142,7 +143,13 @@ function isContact(user, otherId) {
 }
 
 function publicUser(user) {
-  return { id: user.id, username: user.username, name: user.name, online: connections.has(user.id) };
+  return {
+    id: user.id,
+    username: user.username,
+    name: user.name,
+    avatar: PROFILE_AVATARS.has(user.avatar) ? user.avatar : "",
+    online: connections.has(user.id)
+  };
 }
 
 function requireUser(request, response) {
@@ -182,6 +189,7 @@ async function handleApi(request, response, url) {
       id: randomUUID(),
       username,
       name,
+      avatar: "🐿️",
       salt: salt.toString("hex"),
       passwordHash: passwordHash.toString("hex"),
       contacts: [],
@@ -220,6 +228,20 @@ async function handleApi(request, response, url) {
   if (!user) return;
 
   if (request.method === "GET" && url.pathname === "/api/me") {
+    jsonResponse(response, 200, { user: publicUser(user) });
+    return;
+  }
+
+  if (request.method === "PATCH" && url.pathname === "/api/profile") {
+    const body = await readBody(request);
+    if (typeof body.avatar !== "string" || !PROFILE_AVATARS.has(body.avatar)) {
+      jsonResponse(response, 400, { error: "Выберите аватар из списка животных." });
+      return;
+    }
+    user.avatar = body.avatar;
+    saveDatabase();
+    sendToUser(user.id, { type: "profile-updated", user: publicUser(user) });
+    for (const contactId of user.contacts) sendToUser(contactId, { type: "contacts-updated" });
     jsonResponse(response, 200, { user: publicUser(user) });
     return;
   }

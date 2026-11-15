@@ -1,5 +1,6 @@
 const TOKEN_KEY = "burunduk-token";
 const THEME_KEY = "burunduk-theme";
+const ANIMAL_AVATARS = ["🐿️", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐸", "🐵", "🐰", "🦝", "🦉", "🦔", "🐹", "🐶", "🐱", "🐧", "🐤"];
 const authScreen = document.querySelector("#auth-screen");
 const appScreen = document.querySelector("#app-screen");
 const authForm = document.querySelector("#auth-form");
@@ -14,6 +15,7 @@ const contactDialog = document.querySelector("#contact-dialog");
 const callDialog = document.querySelector("#call-dialog");
 const toast = document.querySelector("#toast");
 const callToast = document.querySelector("#call-toast");
+const profileDialog = document.querySelector("#profile-dialog");
 
 let authMode = "login";
 let currentUser = null;
@@ -39,30 +41,41 @@ let callSoundTimeouts = [];
 let audioContext = null;
 let toastAction = null;
 let pushNotificationsConfigured = false;
+let pushSetupIssue = "";
+let serviceWorkerReady = null;
+let selectedAvatar = null;
 let pendingNotificationContactId = new URLSearchParams(location.search).get("contact");
 let notificationsEnabled = localStorage.getItem("burunduk-notifications") !== "false";
 let soundEnabled = localStorage.getItem("burunduk-sound") !== "false";
-const serviceWorkerReady = "serviceWorker" in navigator
-  ? navigator.serviceWorker.register("/service-worker.js")
-    .then(() => navigator.serviceWorker.ready)
-    .catch((error) => {
-      console.warn("Не удалось зарегистрировать Service Worker:", error);
-      return null;
-    })
-  : Promise.resolve(null);
+
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return Promise.resolve(null);
+  if (!serviceWorkerReady) {
+    serviceWorkerReady = navigator.serviceWorker.register("/service-worker.js?v=2", { scope: "/" })
+      .then(() => navigator.serviceWorker.ready)
+      .catch((error) => {
+        console.warn("Не удалось зарегистрировать Service Worker:", error);
+        serviceWorkerReady = null;
+        return null;
+      });
+  }
+  return serviceWorkerReady;
+}
 
 async function getServiceWorkerRegistration() {
   let timeoutId;
   try {
-    return await Promise.race([
-      serviceWorkerReady,
+    const registration = await Promise.race([
+      registerServiceWorker(),
       new Promise((resolve) => {
         timeoutId = setTimeout(() => {
           console.warn("Service Worker не активировался вовремя.");
           resolve(null);
-        }, 6000);
+        }, 10000);
       })
     ]);
+    if (!registration) serviceWorkerReady = null;
+    return registration;
   } finally {
     clearTimeout(timeoutId);
   }
@@ -157,10 +170,25 @@ function decodeApplicationServerKey(value) {
 }
 
 async function syncPushSubscription() {
-  if (!notificationsEnabled || !currentUser || !("Notification" in window) || Notification.permission !== "granted") return false;
+  if (!notificationsEnabled || !currentUser) return false;
+  if (!window.isSecureContext) {
+    pushSetupIssue = "Для push на телефоне нужен HTTPS.";
+    return false;
+  }
+  if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+    pushSetupIssue = "Этот браузер не поддерживает Web Push.";
+    return false;
+  }
+  if (Notification.permission !== "granted") {
+    pushSetupIssue = "Разрешите уведомления для сайта в настройках браузера.";
+    return false;
+  }
   try {
     const registration = await getServiceWorkerRegistration();
-    if (!registration || !("PushManager" in window)) return false;
+    if (!registration) {
+      pushSetupIssue = "Service Worker не запустился. Удалите старую регистрацию сайта в настройках браузера и обновите страницу.";
+      return false;
+    }
     const { publicKey } = await api("/api/push/public-key");
     let subscription = await registration.pushManager.getSubscription();
     if (!subscription) {
@@ -173,16 +201,22 @@ async function syncPushSubscription() {
       method: "POST",
       body: JSON.stringify({ subscription: subscription.toJSON() })
     });
+    pushSetupIssue = "";
     pushNotificationsConfigured = true;
     return true;
   } catch (error) {
     pushNotificationsConfigured = false;
+    pushSetupIssue = "Не удалось создать push-подписку. Проверьте подключение и попробуйте снова.";
     console.warn("Не удалось включить push-уведомления:", error);
     return false;
   }
 }
 
 async function enableSystemNotifications() {
+  if (!window.isSecureContext) {
+    showToast("Push на телефоне работает только по HTTPS. На этом устройстве можно использовать localhost.");
+    return;
+  }
   if (!("Notification" in window)) {
     showToast("Всплывающие уведомления включены. Системные уведомления браузер не поддерживает.");
     return;
@@ -199,13 +233,14 @@ async function enableSystemNotifications() {
   }
   updateNotificationControls();
   if (permission !== "granted") {
-    showToast("Всплывающие уведомления приложения включены. Разрешите системные в настройках браузера.");
+    pushSetupIssue = "Браузер заблокировал уведомления.";
+    showToast("Push заблокирован браузером. Откройте настройки сайта рядом с адресной строкой → «Уведомления» → «Разрешить», затем включите уведомления здесь.");
     return;
   }
   const pushEnabled = await syncPushSubscription();
   showToast(pushEnabled
     ? "Системные уведомления включены, в том числе в фоне"
-    : "Всплывающие уведомления работают. Для системных нужен HTTPS и поддержка Push браузером.");
+    : `Всплывающие уведомления работают. ${pushSetupIssue || "Проверьте поддержку push в браузере."}`);
 }
 
 async function removePushSubscription(token = localStorage.getItem(TOKEN_KEY)) {
@@ -259,10 +294,12 @@ function updateNotificationControls() {
   button.title = !notificationsEnabled
     ? "Включить уведомления"
     : !("Notification" in window) || Notification.permission === "denied"
-      ? "Системные уведомления нужно разрешить в настройках браузера"
+      ? "Push заблокирован браузером: разрешите уведомления в настройках сайта"
       : Notification.permission === "default"
         ? "Нажмите, чтобы настроить системные уведомления"
-        : "Системные уведомления включены";
+        : pushNotificationsConfigured
+          ? "Системные уведомления включены"
+          : "Разрешение есть, но push не подключён — нажмите, чтобы повторить настройку";
 }
 
 function unlockSound() {
@@ -277,7 +314,7 @@ function unlockSound() {
   }
 }
 
-function playTone(frequency, duration = 0.13, volume = 0.055) {
+function playTone(frequency, duration = 0.13, volume = 0.18) {
   if (!soundEnabled) return;
   unlockSound();
   if (!audioContext || audioContext.state === "closed") return;
@@ -307,16 +344,16 @@ function scheduleTone(frequency, duration, volume) {
 }
 
 function playMessageSound() {
-  playTone(680, 0.11);
-  setTimeout(() => playTone(880, 0.12), 100);
+  playTone(680, 0.12, 0.2);
+  setTimeout(() => playTone(880, 0.14, 0.2), 110);
 }
 
 function startCallSound() {
   stopCallSound();
   if (!soundEnabled) return;
   const ring = () => {
-    playTone(560, 0.28, 0.04);
-    callSoundTimeouts.push(setTimeout(() => playTone(740, 0.28, 0.04), 340));
+    playTone(560, 0.3, 0.18);
+    callSoundTimeouts.push(setTimeout(() => playTone(740, 0.3, 0.18), 360));
   };
   ring();
   callSoundTimer = setInterval(ring, 1900);
@@ -456,9 +493,7 @@ async function enterMessenger() {
   }
   authScreen.classList.add("hidden");
   appScreen.classList.remove("hidden");
-  document.querySelector("#profile-name").textContent = currentUser.name;
-  document.querySelector("#profile-username").textContent = `@${currentUser.username}`;
-  document.querySelector("#profile-avatar").textContent = currentUser.name.trim().charAt(0).toLocaleUpperCase("ru");
+  updateProfilePresentation();
   await Promise.all([loadContacts(), loadChats()]);
   if (pendingNotificationContactId) {
     const contact = contactById(pendingNotificationContactId);
@@ -470,6 +505,7 @@ async function enterMessenger() {
   }
   if (notificationsEnabled && "Notification" in window && Notification.permission === "granted") {
     await syncPushSubscription();
+    updateNotificationControls();
   }
   try {
     const config = await api("/api/rtc-config");
@@ -483,6 +519,14 @@ async function enterMessenger() {
 async function loadContacts() {
   const result = await api("/api/contacts");
   contacts = result.contacts;
+  if (currentContact) {
+    const refreshedContact = contactById(currentContact.id);
+    if (refreshedContact) {
+      currentContact = refreshedContact;
+      updateContactHeader(currentContact);
+      document.querySelectorAll(".message-avatar").forEach((avatar) => setAvatarElement(avatar, currentContact));
+    }
+  }
   renderSidebar();
 }
 
@@ -494,6 +538,19 @@ async function loadChats() {
 
 function nameInitial(name) {
   return name.trim().charAt(0).toLocaleUpperCase("ru") || "?";
+}
+
+function setAvatarElement(element, user) {
+  const hasAnimalAvatar = ANIMAL_AVATARS.includes(user.avatar);
+  element.textContent = hasAnimalAvatar ? user.avatar : nameInitial(user.name);
+  element.classList.toggle("emoji-avatar", hasAnimalAvatar);
+}
+
+function updateProfilePresentation() {
+  if (!currentUser) return;
+  document.querySelector("#profile-name").textContent = currentUser.name;
+  document.querySelector("#profile-username").textContent = `@${currentUser.username}`;
+  setAvatarElement(document.querySelector("#profile-avatar"), currentUser);
 }
 
 function contactById(id) {
@@ -551,7 +608,7 @@ function renderSidebar() {
 
     const avatar = document.createElement("span");
     avatar.className = `avatar${entry.online ? " online" : ""}`;
-    avatar.textContent = nameInitial(entry.name);
+    setAvatarElement(avatar, entry);
 
     const copy = document.createElement("span");
     copy.className = "sidebar-item-copy";
@@ -598,7 +655,7 @@ function renderMessages(items) {
     if (!own) {
       const avatar = document.createElement("span");
       avatar.className = "message-avatar avatar";
-      avatar.textContent = nameInitial(currentContact.name);
+      setAvatarElement(avatar, currentContact);
       row.append(avatar);
     }
 
@@ -620,11 +677,7 @@ function renderMessages(items) {
 async function selectContact(contact) {
   if (!contact) return;
   currentContact = contact;
-  document.querySelector("#chat-name").textContent = contact.name;
-  const status = document.querySelector("#chat-status");
-  status.textContent = contact.online ? "в сети" : `@${contact.username}`;
-  status.classList.toggle("online-label", Boolean(contact.online));
-  document.querySelector("#header-avatar").textContent = nameInitial(contact.name);
+  updateContactHeader(contact);
   document.querySelector("#audio-call-button").disabled = false;
   document.querySelector("#video-call-button").disabled = false;
   emptyConversation.classList.add("hidden");
@@ -641,6 +694,14 @@ async function selectContact(contact) {
   } catch (error) {
     showToast(error.message);
   }
+}
+
+function updateContactHeader(contact) {
+  document.querySelector("#chat-name").textContent = contact.name;
+  const status = document.querySelector("#chat-status");
+  status.textContent = contact.online ? "в сети" : `@${contact.username}`;
+  status.classList.toggle("online-label", Boolean(contact.online));
+  setAvatarElement(document.querySelector("#header-avatar"), contact);
 }
 
 sidebarList.addEventListener("click", (event) => {
@@ -671,6 +732,70 @@ function openContactDialog() {
 
 document.querySelectorAll("[data-close-dialog]").forEach((button) => {
   button.addEventListener("click", () => document.querySelector(`#${button.dataset.closeDialog}`).close());
+});
+
+function updateAvatarPicker() {
+  document.querySelectorAll(".animal-avatar-choice").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.avatar === selectedAvatar));
+  });
+  document.querySelector("#profile-dialog-avatar").textContent = selectedAvatar;
+}
+
+function openProfileDialog() {
+  if (!currentUser) return;
+  selectedAvatar = ANIMAL_AVATARS.includes(currentUser.avatar) ? currentUser.avatar : ANIMAL_AVATARS[0];
+  document.querySelector("#profile-dialog-name").textContent = currentUser.name;
+  document.querySelector("#profile-dialog-username").textContent = `@${currentUser.username}`;
+  const picker = document.querySelector("#animal-avatar-picker");
+  picker.replaceChildren(...ANIMAL_AVATARS.map((avatar) => {
+    const option = document.createElement("button");
+    option.className = "animal-avatar-choice";
+    option.type = "button";
+    option.dataset.avatar = avatar;
+    option.setAttribute("aria-label", `Аватар ${avatar}`);
+    option.textContent = avatar;
+    option.addEventListener("click", () => {
+      selectedAvatar = avatar;
+      updateAvatarPicker();
+    });
+    return option;
+  }));
+  document.querySelector("#profile-error").hidden = true;
+  updateAvatarPicker();
+  profileDialog.showModal();
+}
+
+document.querySelector("#profile-open-button").addEventListener("click", openProfileDialog);
+profileDialog.addEventListener("click", (event) => {
+  if (event.target === profileDialog) profileDialog.close();
+});
+document.querySelector("#profile-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const errorElement = document.querySelector("#profile-error");
+  const saveButton = document.querySelector("#profile-save-button");
+  errorElement.hidden = true;
+  saveButton.disabled = true;
+  try {
+    const result = await api("/api/profile", {
+      method: "PATCH",
+      body: JSON.stringify({ avatar: selectedAvatar })
+    });
+    currentUser = result.user;
+    updateProfilePresentation();
+    profileDialog.close();
+    try {
+      await Promise.all([loadContacts(), loadChats()]);
+    } catch (error) {
+      showToast(`Аватар сохранён, но список контактов не обновился: ${error.message}`);
+      return;
+    }
+    showToast("Аватар профиля обновлён");
+  } catch (error) {
+    errorElement.textContent = error.message;
+    errorElement.hidden = false;
+  } finally {
+    saveButton.disabled = false;
+  }
 });
 
 contactDialog.addEventListener("click", (event) => {
@@ -801,6 +926,11 @@ function handleSocketMessage(payload) {
   }
   if (payload.type === "contacts-updated") {
     Promise.all([loadContacts(), loadChats()]).catch((error) => showToast(error.message));
+    return;
+  }
+  if (payload.type === "profile-updated" && payload.user && payload.user.id === currentUser?.id) {
+    currentUser = payload.user;
+    updateProfilePresentation();
     return;
   }
   if (payload.type === "signal") handleCallSignal(payload);

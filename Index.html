@@ -98,11 +98,13 @@
       </div>
 
       <footer class="sidebar-profile">
-        <div class="profile-avatar" id="profile-avatar">Б</div>
-        <div class="profile-copy">
-          <strong id="profile-name"></strong>
-          <span id="profile-username"></span>
-        </div>
+        <button class="profile-open-button" id="profile-open-button" type="button" aria-label="Открыть профиль">
+          <span class="profile-avatar" id="profile-avatar">Б</span>
+          <span class="profile-copy">
+            <strong id="profile-name"></strong>
+            <span id="profile-username"></span>
+          </span>
+        </button>
         <button class="icon-button logout-button" id="logout-button" type="button" aria-label="Выйти из аккаунта" title="Выйти">↪</button>
       </footer>
     </aside>
@@ -165,6 +167,28 @@
       <div class="dialog-actions">
         <button class="secondary-button" type="button" data-close-dialog="contact-dialog">Отмена</button>
         <button class="primary-button" type="submit">Найти и добавить <span>→</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="app-dialog" id="profile-dialog">
+    <form id="profile-form">
+      <div class="dialog-heading">
+        <div><span class="eyebrow">ВАШ АККАУНТ</span><h2>Профиль</h2></div>
+        <button class="icon-button dialog-close" type="button" data-close-dialog="profile-dialog" aria-label="Закрыть">×</button>
+      </div>
+      <div class="profile-dialog-identity">
+        <span class="profile-dialog-avatar" id="profile-dialog-avatar">🐿️</span>
+        <span><strong id="profile-dialog-name"></strong><small id="profile-dialog-username"></small></span>
+      </div>
+      <fieldset class="avatar-picker-field">
+        <legend>Аватар — выберите животное</legend>
+        <div class="animal-avatar-picker" id="animal-avatar-picker" role="group" aria-label="Аватар животного"></div>
+      </fieldset>
+      <p class="form-error" id="profile-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="secondary-button" type="button" data-close-dialog="profile-dialog">Отмена</button>
+        <button class="primary-button" id="profile-save-button" type="submit">Сохранить</button>
       </div>
     </form>
   </dialog>

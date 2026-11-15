@@ -132,6 +132,9 @@ body[data-theme="light"] .auth-art { background: radial-gradient(ellipse at 52% 
 .setting-icon { font-size: 13px; }
 .sidebar-profile { display: flex; align-items: center; gap: 9px; padding: 12px 4px 0; border-top: 1px solid var(--line); }
 .profile-avatar { width: 33px; height: 33px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 11px; background: var(--accent-wash); color: var(--accent); font-size: 12px; font-weight: 700; }
+.profile-open-button { min-width: 0; flex: 1; display: flex; align-items: center; gap: 9px; padding: 0; border: 0; background: transparent; color: var(--ink); text-align: left; }
+.profile-open-button:hover .profile-copy strong { color: var(--accent); }
+.profile-avatar.emoji-avatar { font-size: 20px; }
 .profile-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
 .profile-copy strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .profile-copy span { color: var(--faint); font-size: 9px; }
@@ -156,7 +159,9 @@ body[data-theme="light"] .auth-art { background: radial-gradient(ellipse at 52% 
 .message-list { min-height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 13px; }
 .message-row { display: flex; align-items: flex-end; gap: 8px; }
 .message-row.own { justify-content: flex-end; }
+.avatar.emoji-avatar { font-size: 22px; text-transform: none; }
 .message-avatar { width: 25px; height: 25px; border-radius: 9px; font-size: 9px; }
+.message-avatar.emoji-avatar { font-size: 14px; }
 .bubble-wrap { max-width: min(76%, 470px); display: flex; flex-direction: column; gap: 4px; }
 .message-row.own .bubble-wrap { align-items: flex-end; }
 .bubble { padding: 10px 13px; border: 1px solid var(--line); border-radius: 5px 14px 14px 14px; background: var(--incoming); color: var(--ink); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -180,6 +185,17 @@ body[data-theme="light"] .auth-art { background: radial-gradient(ellipse at 52% 
 .app-dialog, .call-dialog { width: min(420px, calc(100vw - 32px)); padding: 25px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }
 .app-dialog::backdrop, .call-dialog::backdrop { background: rgba(5, 7, 7, .68); backdrop-filter: blur(5px); }
 .app-dialog form { display: flex; flex-direction: column; gap: 15px; }
+.profile-dialog-identity { display: flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-raised); }
+.profile-dialog-avatar { width: 48px; height: 48px; display: grid; flex: 0 0 auto; place-items: center; border-radius: 15px; background: var(--accent-wash); font-size: 27px; }
+.profile-dialog-identity > span:last-child { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.profile-dialog-identity strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.profile-dialog-identity small { color: var(--muted); font-size: 10px; }
+.avatar-picker-field { min-width: 0; margin: 0; padding: 0; border: 0; }
+.avatar-picker-field legend { margin-bottom: 10px; color: var(--muted); font-size: 10px; font-weight: 600; }
+.animal-avatar-picker { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+.animal-avatar-choice { aspect-ratio: 1; display: grid; place-items: center; padding: 0; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-raised); font-size: 23px; transition: border-color .16s, background .16s, transform .16s; }
+.animal-avatar-choice:hover { transform: translateY(-1px); }
+.animal-avatar-choice[aria-checked="true"] { border-color: var(--accent); background: var(--accent-wash); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
 .dialog-heading, .call-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 6px; }
 .dialog-heading h2, .call-heading h2 { margin: 7px 0 0; font-family: Manrope, sans-serif; font-size: 19px; letter-spacing: -.4px; }
 .dialog-close { margin: -7px -8px 0 0; font-size: 23px; }
@@ -237,6 +253,7 @@ body[data-theme="light"] .auth-art { background: radial-gradient(ellipse at 52% 
   .composer { margin-right: 10px; margin-left: 10px; }
   .bubble-wrap { max-width: 84%; }
   .video-stage { min-height: 240px; }
+  .animal-avatar-picker { grid-template-columns: repeat(5, minmax(0, 1fr)); }
   .toast { right: max(12px, env(safe-area-inset-right, 0px)); bottom: calc(12px + env(safe-area-inset-bottom, 0px)); left: max(12px, env(safe-area-inset-left, 0px)); max-width: none; }
   .call-toast { right: 12px; bottom: calc(12px + env(safe-area-inset-bottom, 0px)); left: 12px; }
 }
