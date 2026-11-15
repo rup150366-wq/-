@@ -1,6 +1,10 @@
 const TOKEN_KEY = "burunduk-token";
 const THEME_KEY = "burunduk-theme";
 const ANIMAL_AVATARS = ["🐿️", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐸", "🐵", "🐰", "🦝", "🦉", "🦔", "🐹", "🐶", "🐱", "🐧", "🐤"];
+const MESSAGE_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "👏"];
+const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
+const FILE_CHUNK_BYTES = 16 * 1024;
+const MEDIA_STORE_NAME = "attachments";
 const authScreen = document.querySelector("#auth-screen");
 const appScreen = document.querySelector("#app-screen");
 const authForm = document.querySelector("#auth-form");
@@ -10,6 +14,8 @@ const searchInput = document.querySelector("#search-input");
 const messagesArea = document.querySelector("#messages-area");
 const messagesElement = document.querySelector("#messages");
 const messageInput = document.querySelector("#message-input");
+const fileInput = document.querySelector("#file-input");
+const transferStatus = document.querySelector("#transfer-status");
 const emptyConversation = document.querySelector("#empty-conversation");
 const contactDialog = document.querySelector("#contact-dialog");
 const callDialog = document.querySelector("#call-dialog");
@@ -44,6 +50,13 @@ let pushNotificationsConfigured = false;
 let pushSetupIssue = "";
 let serviceWorkerReady = null;
 let selectedAvatar = null;
+let pendingReplyToId = null;
+let currentMessagesById = new Map();
+let mediaDatabasePromise = null;
+const fileLinks = new Map();
+const outgoingTransfers = new Map();
+const incomingTransfers = new Map();
+const mediaObjectUrls = new Set();
 const initialUrl = new URLSearchParams(location.search);
 let pendingNotificationContactId = initialUrl.get("contact");
 let pendingMissedCallNotification = initialUrl.get("missedCall") === "1";
@@ -53,7 +66,7 @@ let soundEnabled = localStorage.getItem("burunduk-sound") !== "false";
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return Promise.resolve(null);
   if (!serviceWorkerReady) {
-    serviceWorkerReady = navigator.serviceWorker.register("/service-worker.js?v=3", { scope: "/" })
+    serviceWorkerReady = navigator.serviceWorker.register("/service-worker.js?v=4", { scope: "/" })
       .then(() => navigator.serviceWorker.ready)
       .catch((error) => {
         console.warn("Не удалось зарегистрировать Service Worker:", error);
@@ -125,6 +138,67 @@ function showToast(message, action = null) {
     targetToast.classList.remove("show", "actionable");
     toastAction = null;
   }, 7000);
+}
+
+function getMediaDatabase() {
+  if (!("indexedDB" in window)) return Promise.reject(new Error("Браузер не поддерживает локальное хранилище файлов."));
+  if (!mediaDatabasePromise) {
+    mediaDatabasePromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open("burunduk-media", 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(MEDIA_STORE_NAME)) {
+          request.result.createObjectStore(MEDIA_STORE_NAME, { keyPath: "messageId" });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => {
+        mediaDatabasePromise = null;
+        reject(request.error || new Error("Не удалось открыть хранилище файлов."));
+      };
+      request.onblocked = () => {
+        mediaDatabasePromise = null;
+        reject(new Error("Закройте другие вкладки Бурундука и повторите попытку."));
+      };
+    });
+  }
+  return mediaDatabasePromise;
+}
+
+async function storeMediaAttachment(messageId, blob) {
+  const database = await getMediaDatabase();
+  await new Promise((resolve, reject) => {
+    const transaction = database.transaction(MEDIA_STORE_NAME, "readwrite");
+    transaction.objectStore(MEDIA_STORE_NAME).put({ messageId, blob });
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error || new Error("Не удалось сохранить файл на устройстве."));
+    transaction.onabort = () => reject(transaction.error || new Error("Сохранение файла было прервано."));
+  });
+}
+
+async function loadMediaAttachment(messageId) {
+  const database = await getMediaDatabase();
+  return new Promise((resolve, reject) => {
+    const request = database.transaction(MEDIA_STORE_NAME, "readonly")
+      .objectStore(MEDIA_STORE_NAME)
+      .get(messageId);
+    request.onsuccess = () => resolve(request.result?.blob || null);
+    request.onerror = () => reject(request.error || new Error("Не удалось прочитать файл с устройства."));
+  });
+}
+
+async function removeMediaAttachment(messageId) {
+  const database = await getMediaDatabase();
+  await new Promise((resolve, reject) => {
+    const transaction = database.transaction(MEDIA_STORE_NAME, "readwrite");
+    transaction.objectStore(MEDIA_STORE_NAME).delete(messageId);
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error || new Error("Не удалось удалить временный файл."));
+  });
+}
+
+function updateTransferStatus(text) {
+  transferStatus.textContent = text;
+  transferStatus.classList.remove("hidden");
 }
 
 function showNotification(title, body, contactId, serverPushWillNotify = false) {
@@ -634,7 +708,11 @@ function renderSidebar() {
     const bottom = document.createElement("span");
     bottom.className = "sidebar-item-bottom";
     const preview = document.createElement("span");
-    preview.textContent = activeSection === "chats" ? (entry.lastMessage?.text || "") : `@${entry.username}`;
+    preview.textContent = activeSection === "chats"
+      ? (entry.lastMessage?.type === "attachment"
+        ? `📎 ${entry.lastMessage.attachment.name}`
+        : (entry.lastMessage?.text || ""))
+      : `@${entry.username}`;
     bottom.append(preview);
     copy.append(top, bottom);
     item.append(avatar, copy);
@@ -656,11 +734,16 @@ function formatMessageTime(value) {
 }
 
 function renderMessages(items) {
+  for (const objectUrl of mediaObjectUrls) URL.revokeObjectURL(objectUrl);
+  mediaObjectUrls.clear();
   messagesElement.replaceChildren();
+  const messagesById = new Map(items.map((message) => [message.id, message]));
+  currentMessagesById = messagesById;
   for (const message of items) {
     const own = message.fromId === currentUser.id;
     const row = document.createElement("div");
     row.className = `message-row${own ? " own" : ""}`;
+    row.dataset.messageId = message.id;
     if (!own) {
       const avatar = document.createElement("span");
       avatar.className = "message-avatar avatar";
@@ -672,19 +755,211 @@ function renderMessages(items) {
     wrap.className = "bubble-wrap";
     const bubble = document.createElement("div");
     bubble.className = "bubble";
-    bubble.textContent = message.text;
+    if (message.replyToId) {
+      const repliedTo = messagesById.get(message.replyToId);
+      const quote = document.createElement("div");
+      quote.className = "reply-quote";
+      const quoteAuthor = document.createElement("strong");
+      quoteAuthor.textContent = repliedTo
+        ? (repliedTo.fromId === currentUser.id ? "Вы" : currentContact.name)
+        : "Ответ";
+      const quoteText = document.createElement("span");
+      quoteText.textContent = repliedTo
+        ? (repliedTo.type === "attachment" ? `📎 ${repliedTo.attachment.name}` : repliedTo.text)
+        : "Сообщение недоступно";
+      quote.append(quoteAuthor, quoteText);
+      bubble.append(quote);
+    }
+    if (message.type === "attachment" && message.attachment) {
+      renderAttachmentMessage(message, bubble);
+    } else {
+      const text = document.createElement("span");
+      text.className = "message-text";
+      text.textContent = message.text;
+      bubble.append(text);
+    }
+    const reactions = document.createElement("div");
+    reactions.className = "message-reactions";
+    for (const [emoji, users] of Object.entries(message.reactions || {})) {
+      if (!Array.isArray(users) || users.length === 0) continue;
+      const chip = document.createElement("button");
+      chip.className = "reaction-chip";
+      chip.type = "button";
+      chip.dataset.messageAction = "reaction";
+      chip.dataset.messageId = message.id;
+      chip.dataset.emoji = emoji;
+      chip.setAttribute("aria-pressed", String(users.includes(currentUser.id)));
+      chip.textContent = `${emoji} ${users.length}`;
+      reactions.append(chip);
+    }
     const meta = document.createElement("div");
     meta.className = "message-meta";
     meta.textContent = formatMessageTime(message.createdAt);
-    wrap.append(bubble, meta);
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+    const replyButton = document.createElement("button");
+    replyButton.className = "message-action";
+    replyButton.type = "button";
+    replyButton.dataset.messageAction = "reply";
+    replyButton.dataset.messageId = message.id;
+    replyButton.setAttribute("aria-label", "Ответить на сообщение");
+    replyButton.title = "Ответить";
+    replyButton.textContent = "↩";
+    const reactionsWrap = document.createElement("div");
+    reactionsWrap.className = "reaction-menu-wrap";
+    const reactionsButton = document.createElement("button");
+    reactionsButton.className = "message-action";
+    reactionsButton.type = "button";
+    reactionsButton.dataset.messageAction = "toggle-reactions";
+    reactionsButton.setAttribute("aria-label", "Выбрать реакцию");
+    reactionsButton.setAttribute("aria-expanded", "false");
+    reactionsButton.title = "Реакция";
+    reactionsButton.textContent = "☺";
+    const picker = document.createElement("div");
+    picker.className = "reaction-picker hidden";
+    picker.setAttribute("aria-label", "Выберите реакцию");
+    for (const emoji of MESSAGE_REACTIONS) {
+      const emojiButton = document.createElement("button");
+      emojiButton.type = "button";
+      emojiButton.dataset.messageAction = "reaction";
+      emojiButton.dataset.messageId = message.id;
+      emojiButton.dataset.emoji = emoji;
+      emojiButton.setAttribute("aria-label", emoji);
+      emojiButton.textContent = emoji;
+      picker.append(emojiButton);
+    }
+    reactionsWrap.append(reactionsButton, picker);
+    actions.append(replyButton, reactionsWrap);
+    wrap.append(bubble);
+    if (reactions.childElementCount > 0) wrap.append(reactions);
+    wrap.append(actions, meta);
     row.append(wrap);
     messagesElement.append(row);
   }
   messagesArea.scrollTop = messagesArea.scrollHeight;
 }
 
+function formatFileSize(size) {
+  if (size < 1024 * 1024) return `${Math.max(1, Math.round(size / 1024))} КБ`;
+  return `${(size / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+function renderAttachmentMessage(message, bubble) {
+  const attachment = message.attachment;
+  const card = document.createElement("div");
+  card.className = "attachment-card";
+  const name = document.createElement("strong");
+  name.className = "attachment-name";
+  name.textContent = attachment.name;
+  const details = document.createElement("span");
+  details.className = "attachment-details";
+  details.textContent = `${attachment.mimeType.startsWith("video/") ? "Видео" : "Изображение"} · ${formatFileSize(attachment.size)}`;
+  const status = document.createElement("span");
+  status.className = "attachment-status";
+  status.textContent = "Проверяем файл на устройстве...";
+  card.append(name, details, status);
+  bubble.append(card);
+
+  void loadMediaAttachment(message.id).then((blob) => {
+    if (!bubble.isConnected) return;
+    if (!blob) {
+      status.textContent = "Файл недоступен на этом устройстве";
+      return;
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    mediaObjectUrls.add(objectUrl);
+    status.remove();
+    if (attachment.mimeType.startsWith("image/")) {
+      const image = document.createElement("img");
+      image.className = "attachment-preview";
+      image.src = objectUrl;
+      image.alt = attachment.name;
+      image.loading = "lazy";
+      card.insertBefore(image, name);
+    } else if (attachment.mimeType.startsWith("video/")) {
+      const video = document.createElement("video");
+      video.className = "attachment-preview";
+      video.src = objectUrl;
+      video.controls = true;
+      video.playsInline = true;
+      card.insertBefore(video, name);
+    }
+    const download = document.createElement("a");
+    download.className = "attachment-download";
+    download.href = objectUrl;
+    download.download = attachment.name;
+    download.textContent = "Открыть или скачать";
+    card.append(download);
+  }).catch((error) => {
+    if (!bubble.isConnected) return;
+    console.error("Не удалось открыть локальное вложение:", error);
+    status.textContent = "Не удалось прочитать файл с устройства";
+  });
+}
+
+function clearPendingReply() {
+  pendingReplyToId = null;
+  document.querySelector("#reply-preview").classList.add("hidden");
+}
+
+function prepareReply(message) {
+  pendingReplyToId = message.id;
+  document.querySelector("#reply-sender").textContent = message.fromId === currentUser.id ? "Вы отвечаете себе" : `Ответ ${currentContact.name}`;
+  document.querySelector("#reply-text").textContent = message.type === "attachment"
+    ? `📎 ${message.attachment.name}`
+    : message.text;
+  document.querySelector("#reply-preview").classList.remove("hidden");
+  messageInput.focus();
+}
+
+function sendMessageReaction(messageId, emoji) {
+  if (!currentContact || !socket || socket.readyState !== WebSocket.OPEN) {
+    showToast("Нет соединения с сервером");
+    return;
+  }
+  socket.send(JSON.stringify({
+    type: "reaction",
+    toId: currentContact.id,
+    messageId,
+    emoji
+  }));
+}
+
+messagesElement.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-message-action]");
+  if (!button) return;
+  const action = button.dataset.messageAction;
+  const row = button.closest(".message-row");
+  if (!row) return;
+  const messageId = button.dataset.messageId || row.dataset.messageId;
+  if (action === "reply") {
+    const message = row.dataset.messageId;
+    const target = message && currentMessagesById.get(message);
+    if (target) prepareReply(target);
+    return;
+  }
+  if (action === "toggle-reactions") {
+    const picker = button.parentElement.querySelector(".reaction-picker");
+    const willOpen = picker.classList.contains("hidden");
+    picker.classList.toggle("hidden", !willOpen);
+    button.setAttribute("aria-expanded", String(willOpen));
+    return;
+  }
+  if (action === "reaction") {
+    sendMessageReaction(messageId, button.dataset.emoji);
+    const picker = button.closest(".reaction-picker");
+    if (picker) picker.classList.add("hidden");
+    const trigger = button.closest(".reaction-menu-wrap")?.querySelector("[data-message-action='toggle-reactions']");
+    if (trigger) trigger.setAttribute("aria-expanded", "false");
+  }
+});
+
+document.querySelector("#cancel-reply").addEventListener("click", clearPendingReply);
+
 async function selectContact(contact) {
   if (!contact) return;
+  clearPendingReply();
+  transferStatus.classList.add("hidden");
   currentContact = contact;
   updateContactHeader(contact);
   document.querySelector("#audio-call-button").disabled = false;
@@ -839,15 +1114,41 @@ document.querySelector("#message-form").addEventListener("submit", (event) => {
     showToast("Нет соединения с сервером");
     return;
   }
-  socket.send(JSON.stringify({ type: "message", toId: currentContact.id, text }));
+  socket.send(JSON.stringify({
+    type: "message",
+    toId: currentContact.id,
+    text,
+    replyToId: pendingReplyToId
+  }));
   messageInput.value = "";
+  messageInput.style.height = "auto";
+  clearPendingReply();
   sendTyping(false);
   messageInput.focus();
 });
 
 document.querySelector(".emoji-button").addEventListener("click", () => {
   messageInput.value += " 🙂";
+  messageInput.dispatchEvent(new Event("input", { bubbles: true }));
   messageInput.focus();
+});
+
+document.querySelector("#file-button").addEventListener("click", () => {
+  if (!currentContact) {
+    showToast("Сначала выберите контакт");
+    return;
+  }
+  if (!currentContact.online) {
+    showToast("Фото и видео можно отправить, когда собеседник в сети.");
+    return;
+  }
+  fileInput.click();
+});
+
+fileInput.addEventListener("change", () => {
+  const files = Array.from(fileInput.files || []);
+  fileInput.value = "";
+  if (files.length > 0) void sendMediaFiles(files);
 });
 
 function sendTyping(active) {
@@ -856,10 +1157,437 @@ function sendTyping(active) {
   }
 }
 
+function sendFileSignal(toId, signal) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("Нет соединения с сервером.");
+  socket.send(JSON.stringify({ type: "file-signal", toId, signal }));
+}
+
+function settleFileLink(link, error = null) {
+  if (link.readySettled) return;
+  link.readySettled = true;
+  link.resolveReady(error ? { error } : { channel: link.channel });
+}
+
+function failFileLink(link, error) {
+  if (link.failed) return;
+  link.failed = true;
+  if (fileLinks.get(link.peerId) === link) fileLinks.delete(link.peerId);
+  settleFileLink(link, error);
+  for (const [transferId, transfer] of outgoingTransfers) {
+    if (transfer.peerId !== link.peerId) continue;
+    clearTimeout(transfer.timeout);
+    transfer.reject(error);
+    outgoingTransfers.delete(transferId);
+  }
+  for (const [transferId, transfer] of incomingTransfers) {
+    if (transfer.peerId === link.peerId) incomingTransfers.delete(transferId);
+  }
+  if (link.pc.connectionState !== "closed") link.pc.close();
+}
+
+function attachFileChannel(link, channel) {
+  link.channel = channel;
+  channel.binaryType = "arraybuffer";
+  channel.bufferedAmountLowThreshold = 128 * 1024;
+  channel.addEventListener("open", () => settleFileLink(link));
+  channel.addEventListener("message", (event) => {
+    void handleFileDataMessage(link, event).catch((error) => {
+      console.error("Ошибка передачи P2P-файла:", error);
+      updateTransferStatus("Не удалось принять файл.");
+      let transferId = "";
+      if (typeof event.data === "string") {
+        try {
+          transferId = JSON.parse(event.data).transferId || "";
+        } catch {
+          transferId = "";
+        }
+      } else if (event.data instanceof ArrayBuffer && event.data.byteLength >= 36) {
+        transferId = new TextDecoder().decode(new Uint8Array(event.data).subarray(0, 36));
+      }
+      if (transferId) incomingTransfers.delete(transferId);
+      if (channel.readyState === "open") {
+        channel.send(JSON.stringify({
+          kind: "error",
+          transferId,
+          error: "Не удалось сохранить файл на устройстве."
+        }));
+      }
+    });
+  });
+  channel.addEventListener("close", () => {
+    if (fileLinks.get(link.peerId) === link) fileLinks.delete(link.peerId);
+    failFileLink(link, new Error("P2P-соединение передачи файла закрыто."));
+  });
+  channel.addEventListener("error", () => failFileLink(link, new Error("Ошибка P2P-канала передачи файла.")));
+  if (channel.readyState === "open") settleFileLink(link);
+}
+
+function createFileLink(peerId, isOfferer) {
+  const connection = new RTCPeerConnection({ iceServers });
+  let resolveReady;
+  const link = {
+    peerId,
+    pc: connection,
+    channel: null,
+    isOfferer,
+    requestSent: false,
+    pendingCandidates: [],
+    readyPromise: new Promise((resolve) => { resolveReady = resolve; }),
+    resolveReady,
+    readySettled: false
+  };
+  fileLinks.set(peerId, link);
+  connection.onicecandidate = (event) => {
+    if (!event.candidate) return;
+    try {
+      sendFileSignal(peerId, { kind: "candidate", candidate: event.candidate });
+    } catch (error) {
+      failFileLink(link, error);
+    }
+  };
+  connection.ondatachannel = (event) => attachFileChannel(link, event.channel);
+  connection.onconnectionstatechange = () => {
+    if (connection.connectionState === "failed" || connection.connectionState === "closed") {
+      failFileLink(link, new Error("Не удалось установить прямое соединение. Возможно, потребуется TURN."));
+    }
+  };
+  if (isOfferer) {
+    attachFileChannel(link, connection.createDataChannel("burunduk-media", { ordered: true }));
+    void (async () => {
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+      sendFileSignal(peerId, { kind: "offer", description: connection.localDescription });
+    })().catch((error) => failFileLink(link, error));
+  }
+  return link;
+}
+
+function waitForFileChannel(link) {
+  let timeoutId;
+  return Promise.race([
+    link.readyPromise,
+    new Promise((resolve) => {
+      timeoutId = setTimeout(() => resolve({
+        error: new Error("Не удалось соединиться напрямую. Проверьте сеть и настройку TURN.")
+      }), 25_000);
+    })
+  ]).then((result) => {
+    clearTimeout(timeoutId);
+    if (result.error) throw result.error;
+    return result.channel;
+  });
+}
+
+async function ensureFileChannel(peerId) {
+  if (typeof RTCPeerConnection === "undefined") throw new Error("Этот браузер не поддерживает P2P-передачу файлов.");
+  let link = fileLinks.get(peerId);
+  if (
+    link &&
+    (link.pc.connectionState === "failed" ||
+      link.pc.connectionState === "closed" ||
+      link.channel?.readyState === "closed")
+  ) {
+    link.pc.close();
+    fileLinks.delete(peerId);
+    link = null;
+  }
+  if (!link) {
+    const isOfferer = currentUser.id.localeCompare(peerId) < 0;
+    link = createFileLink(peerId, isOfferer);
+  }
+  if (!link.isOfferer && !link.requestSent) {
+    sendFileSignal(peerId, { kind: "request" });
+    link.requestSent = true;
+  }
+  try {
+    return await waitForFileChannel(link);
+  } catch (error) {
+    if (fileLinks.get(peerId) === link) {
+      fileLinks.delete(peerId);
+      link.pc.close();
+    }
+    throw error;
+  }
+}
+
+async function waitForFileBuffer(channel) {
+  if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) return;
+  await new Promise((resolve, reject) => {
+    const onLow = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error("P2P-соединение прервано."));
+    };
+    const cleanup = () => {
+      channel.removeEventListener("bufferedamountlow", onLow);
+      channel.removeEventListener("close", onClose);
+    };
+    channel.addEventListener("bufferedamountlow", onLow);
+    channel.addEventListener("close", onClose);
+    if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) onLow();
+  });
+  if (channel.readyState !== "open") throw new Error("P2P-соединение прервано.");
+}
+
+async function sendMediaFiles(files) {
+  const contact = currentContact;
+  if (!contact) return;
+  if (!contact.online) {
+    showToast("Фото и видео можно отправить, когда собеседник в сети.");
+    return;
+  }
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    showToast("Нет соединения с сервером");
+    return;
+  }
+  for (const file of files) {
+    if (!file.type.startsWith("image/") && !file.type.startsWith("video/")) {
+      showToast(`${file.name}: выберите изображение или видео.`);
+      continue;
+    }
+    if (file.size < 1 || file.size > MAX_MEDIA_BYTES) {
+      showToast(`${file.name}: максимальный размер — 50 МБ.`);
+      continue;
+    }
+    try {
+      await sendMediaFile(file, contact);
+    } catch (error) {
+      console.error("Не удалось передать файл:", error);
+      showToast(error.message || "Не удалось передать файл.");
+      updateTransferStatus(`Ошибка передачи: ${file.name}`);
+    }
+  }
+}
+
+async function sendMediaFile(file, contact) {
+  updateTransferStatus(`Соединяемся с ${contact.name}…`);
+  const channel = await ensureFileChannel(contact.id);
+  if (channel.readyState !== "open") throw new Error("P2P-канал передачи файла недоступен.");
+  const messageId = crypto.randomUUID();
+  const transferId = crypto.randomUUID();
+  const transferHeader = new TextEncoder().encode(transferId);
+  await storeMediaAttachment(messageId, file);
+  let acknowledgement;
+  try {
+    const ackPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        outgoingTransfers.delete(transferId);
+        reject(new Error("Собеседник не подтвердил получение файла."));
+      }, 180_000);
+      outgoingTransfers.set(transferId, {
+        peerId: contact.id,
+        resolve,
+        reject,
+        timeout
+      });
+    });
+    void ackPromise.catch(() => {});
+    channel.send(JSON.stringify({
+      kind: "start",
+      transferId,
+      messageId,
+      name: file.name,
+      mimeType: file.type,
+      size: file.size
+    }));
+    let lastProgressUpdate = 0;
+    for (let offset = 0; offset < file.size; offset += FILE_CHUNK_BYTES) {
+      await waitForFileBuffer(channel);
+      const chunk = new Uint8Array(await file.slice(offset, offset + FILE_CHUNK_BYTES).arrayBuffer());
+      const frame = new Uint8Array(transferHeader.length + chunk.length);
+      frame.set(transferHeader);
+      frame.set(chunk, transferHeader.length);
+      channel.send(frame.buffer);
+      const sentBytes = Math.min(file.size, offset + chunk.length);
+      if (sentBytes - lastProgressUpdate >= 512 * 1024 || sentBytes === file.size) {
+        updateTransferStatus(`Отправка ${file.name}: ${Math.round((sentBytes / file.size) * 100)}%`);
+        lastProgressUpdate = sentBytes;
+      }
+    }
+    channel.send(JSON.stringify({ kind: "end", transferId }));
+    await ackPromise;
+    acknowledgement = true;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Файл доставлен, но сервер отключился до сохранения сообщения. Повторите отправку.");
+    }
+    socket.send(JSON.stringify({
+      type: "attachment",
+      toId: contact.id,
+      attachment: {
+        id: messageId,
+        name: file.name,
+        mimeType: file.type,
+        size: file.size
+      }
+    }));
+    updateTransferStatus(`Файл отправлен: ${file.name}`);
+    setTimeout(() => {
+      if (transferStatus.textContent === `Файл отправлен: ${file.name}`) transferStatus.classList.add("hidden");
+    }, 5000);
+  } catch (error) {
+    const transfer = outgoingTransfers.get(transferId);
+    if (transfer) {
+      clearTimeout(transfer.timeout);
+      outgoingTransfers.delete(transferId);
+    }
+    if (channel.readyState === "open") channel.send(JSON.stringify({ kind: "abort", transferId }));
+    if (!acknowledgement) {
+      try {
+        await removeMediaAttachment(messageId);
+      } catch (storageError) {
+        console.error("Не удалось удалить незавершённое вложение:", storageError);
+      }
+    }
+    throw error;
+  }
+}
+
+async function handleFileDataMessage(link, event) {
+  const channel = link.channel;
+  if (typeof event.data === "string") {
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      throw new Error("Получено некорректное сообщение P2P-канала.");
+    }
+    if (payload.kind === "start") {
+      const validFileType = typeof payload.mimeType === "string" &&
+        (/^image\/[a-z0-9.+-]{1,64}$/i.test(payload.mimeType) || /^video\/[a-z0-9.+-]{1,64}$/i.test(payload.mimeType));
+      if (
+        typeof payload.transferId !== "string" ||
+        !/^[0-9a-f-]{36}$/i.test(payload.transferId) ||
+        typeof payload.messageId !== "string" ||
+        !/^[0-9a-f-]{36}$/i.test(payload.messageId) ||
+        typeof payload.name !== "string" ||
+        payload.name.length < 1 ||
+        payload.name.length > 255 ||
+        !validFileType ||
+        !Number.isSafeInteger(payload.size) ||
+        payload.size < 1 ||
+        payload.size > MAX_MEDIA_BYTES ||
+        incomingTransfers.size >= 3
+      ) {
+        channel.send(JSON.stringify({ kind: "error", transferId: payload.transferId || "", error: "Файл не прошёл проверку или превышает лимит 50 МБ." }));
+        return;
+      }
+      incomingTransfers.set(payload.transferId, {
+        peerId: link.peerId,
+        messageId: payload.messageId,
+        name: payload.name.replace(/[\\/\u0000-\u001f]/g, "_"),
+        mimeType: payload.mimeType,
+        size: payload.size,
+        received: 0,
+        chunks: []
+      });
+      updateTransferStatus(`Получение файла: ${payload.name} · 0%`);
+      return;
+    }
+    if (payload.kind === "end") {
+      const transfer = incomingTransfers.get(payload.transferId);
+      if (!transfer || transfer.peerId !== link.peerId || transfer.received !== transfer.size) {
+        channel.send(JSON.stringify({ kind: "error", transferId: payload.transferId || "", error: "Получен неполный файл." }));
+        incomingTransfers.delete(payload.transferId);
+        return;
+      }
+      const blob = new Blob(transfer.chunks, { type: transfer.mimeType });
+      await storeMediaAttachment(transfer.messageId, blob);
+      channel.send(JSON.stringify({ kind: "received", transferId: payload.transferId }));
+      incomingTransfers.delete(payload.transferId);
+      updateTransferStatus(`Файл получен: ${transfer.name}`);
+      setTimeout(() => {
+        if (transferStatus.textContent === `Файл получен: ${transfer.name}`) transferStatus.classList.add("hidden");
+      }, 5000);
+      return;
+    }
+    if (payload.kind === "received" || payload.kind === "error") {
+      const transfer = outgoingTransfers.get(payload.transferId);
+      if (!transfer || transfer.peerId !== link.peerId) return;
+      clearTimeout(transfer.timeout);
+      outgoingTransfers.delete(payload.transferId);
+      if (payload.kind === "received") transfer.resolve();
+      else transfer.reject(new Error(payload.error || "Собеседник не смог сохранить файл."));
+      return;
+    }
+    if (payload.kind === "abort") {
+      incomingTransfers.delete(payload.transferId);
+      return;
+    }
+    throw new Error("Получена неизвестная команда P2P-канала.");
+  }
+
+  if (!(event.data instanceof ArrayBuffer) || event.data.byteLength <= 36) {
+    throw new Error("Получен некорректный блок файла.");
+  }
+  const bytes = new Uint8Array(event.data);
+  const transferId = new TextDecoder().decode(bytes.subarray(0, 36));
+  const transfer = incomingTransfers.get(transferId);
+  if (!transfer || transfer.peerId !== link.peerId) return;
+  const chunk = bytes.slice(36);
+  if (transfer.received + chunk.length > transfer.size) {
+    incomingTransfers.delete(transferId);
+    channel.send(JSON.stringify({ kind: "error", transferId, error: "Размер полученного файла не совпадает." }));
+    return;
+  }
+  transfer.chunks.push(chunk);
+  transfer.received += chunk.length;
+  if (transfer.received === transfer.size || transfer.received % (1024 * 1024) < chunk.length) {
+    updateTransferStatus(`Получение файла: ${Math.round((transfer.received / transfer.size) * 100)}%`);
+  }
+}
+
+async function handleFileSignal(payload) {
+  const { from, signal } = payload;
+  if (!from || !signal || typeof from.id !== "string") return;
+  if (signal.kind === "request") {
+    if (currentUser.id.localeCompare(from.id) >= 0) return;
+    const existing = fileLinks.get(from.id);
+    if (existing && existing.pc.connectionState !== "failed" && existing.pc.connectionState !== "closed") return;
+    if (existing) existing.pc.close();
+    createFileLink(from.id, true);
+    return;
+  }
+
+  let link = fileLinks.get(from.id);
+  if (!link && signal.kind === "offer") link = createFileLink(from.id, false);
+  if (!link && signal.kind === "candidate") link = createFileLink(from.id, false);
+  if (!link) return;
+  if (signal.kind === "offer") {
+    if (link.isOfferer) return;
+    await link.pc.setRemoteDescription(signal.description);
+    for (const candidate of link.pendingCandidates.splice(0)) await link.pc.addIceCandidate(candidate);
+    const answer = await link.pc.createAnswer();
+    await link.pc.setLocalDescription(answer);
+    sendFileSignal(from.id, { kind: "answer", description: link.pc.localDescription });
+    return;
+  }
+  if (signal.kind === "answer" && link.isOfferer) {
+    await link.pc.setRemoteDescription(signal.description);
+    for (const candidate of link.pendingCandidates.splice(0)) await link.pc.addIceCandidate(candidate);
+    return;
+  }
+  if (signal.kind === "candidate") {
+    if (link.pc.remoteDescription) await link.pc.addIceCandidate(signal.candidate);
+    else link.pendingCandidates.push(signal.candidate);
+  }
+}
+
 messageInput.addEventListener("input", () => {
+  messageInput.style.height = "auto";
+  messageInput.style.height = `${Math.min(messageInput.scrollHeight, 120)}px`;
   sendTyping(true);
   clearTimeout(typingTimer);
   typingTimer = setTimeout(() => sendTyping(false), 900);
+});
+
+messageInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    document.querySelector("#message-form").requestSubmit();
+  }
 });
 
 function connectWebSocket() {
@@ -915,6 +1643,29 @@ function handleSocketMessage(payload) {
     loadChats().catch((error) => showToast(error.message));
     return;
   }
+  if (payload.type === "attachment") {
+    const message = payload.message;
+    if (message.fromId !== currentUser.id) {
+      const sender = contactById(message.fromId);
+      showNotification(
+        `Вложение от ${sender?.name || "контакта"}`,
+        message.attachment.name,
+        message.fromId,
+        true
+      );
+      playMessageSound();
+    }
+    if (currentContact && (message.fromId === currentContact.id || message.toId === currentContact.id)) {
+      loadCurrentConversation();
+    }
+    loadChats().catch((error) => showToast(error.message));
+    return;
+  }
+  if (payload.type === "reaction") {
+    if (currentContact && payload.toId === currentContact.id) loadCurrentConversation();
+    loadChats().catch((error) => showToast(error.message));
+    return;
+  }
   if (payload.type === "presence") {
     const contact = contactById(payload.userId);
     if (contact) contact.online = payload.online;
@@ -943,6 +1694,14 @@ function handleSocketMessage(payload) {
     return;
   }
   if (payload.type === "signal") handleCallSignal(payload);
+  if (payload.type === "file-signal") {
+    void handleFileSignal(payload).catch((error) => {
+      console.error("Не удалось обработать сигнал P2P:", error);
+      const link = payload.from?.id ? fileLinks.get(payload.from.id) : null;
+      if (link) failFileLink(link, error);
+      showToast("Не удалось установить соединение для передачи файла.");
+    });
+  }
   if (payload.type === "error") showToast(payload.error);
 }
 
@@ -962,6 +1721,9 @@ document.querySelector("#logout-button").addEventListener("click", () => {
   void removePushSubscription();
   localStorage.removeItem(TOKEN_KEY);
   clearTimeout(reconnectTimer);
+  for (const link of fileLinks.values()) link.pc.close();
+  fileLinks.clear();
+  incomingTransfers.clear();
   socket?.close();
   socket = null;
   currentUser = null;

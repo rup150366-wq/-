@@ -14,6 +14,9 @@ const DATA_DIR = join(ROOT_DIR, "data");
 const DATA_FILE = join(DATA_DIR, "messenger.json");
 const VAPID_KEYS_FILE = join(DATA_DIR, "vapid-keys.json");
 const PROFILE_AVATARS = new Set(["🐿️", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐸", "🐵", "🐰", "🦝", "🦉", "🦔", "🐹", "🐶", "🐱", "🐧", "🐤"]);
+const MESSAGE_REACTIONS = new Set(["👍", "❤️", "😂", "😮", "😢", "👏"]);
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CLIENT_FILES = new Map([
   ["/", "Index.html"],
   ["/Index.html", "Index.html"],
@@ -140,6 +143,11 @@ function sendPushToUser(userId, payload) {
 
 function isContact(user, otherId) {
   return user.contacts.includes(otherId);
+}
+
+function belongsToConversation(message, firstUserId, secondUserId) {
+  return (message.fromId === firstUserId && message.toId === secondUserId) ||
+    (message.fromId === secondUserId && message.toId === firstUserId);
 }
 
 function publicUser(user) {
@@ -484,7 +492,17 @@ webSocketServer.on("connection", (webSocket) => {
     if (payload.type === "message") {
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       const recipient = findUser(payload.toId);
-      if (!text || text.length > 4000 || !recipient || !isContact(user, recipient.id)) {
+      const replyToId = typeof payload.replyToId === "string" ? payload.replyToId : "";
+      const replyTarget = replyToId
+        ? database.messages.find((item) => item.id === replyToId && belongsToConversation(item, user.id, payload.toId))
+        : undefined;
+      if (
+        !text ||
+        text.length > 4000 ||
+        !recipient ||
+        !isContact(user, recipient.id) ||
+        (replyToId && !replyTarget)
+      ) {
         webSocket.send(JSON.stringify({ type: "error", error: "Не удалось отправить сообщение." }));
         return;
       }
@@ -493,6 +511,8 @@ webSocketServer.on("connection", (webSocket) => {
         fromId: user.id,
         toId: recipient.id,
         text,
+        replyToId: replyToId || null,
+        reactions: {},
         createdAt: new Date().toISOString()
       };
       database.messages.push(message);
@@ -503,13 +523,106 @@ webSocketServer.on("connection", (webSocket) => {
         title: `Сообщение от ${user.name}`,
         body: message.text.slice(0, 120),
         contactId: user.id,
-        tag: `burunduk-${user.id}`
+        tag: `burunduk-chat-${user.id}`
       });
+      return;
+    }
+
+    if (payload.type === "attachment") {
+      const recipient = findUser(payload.toId);
+      const attachment = payload.attachment;
+      const name = typeof attachment?.name === "string"
+        ? attachment.name.trim().replace(/[\\/\u0000-\u001f]/g, "_").slice(0, 255)
+        : "";
+      const mimeType = typeof attachment?.mimeType === "string" ? attachment.mimeType : "";
+      const size = attachment?.size;
+      if (
+        !recipient ||
+        !isContact(user, recipient.id) ||
+        typeof attachment?.id !== "string" ||
+        !UUID_PATTERN.test(attachment.id) ||
+        database.messages.some((item) => item.id === attachment.id) ||
+        !name ||
+        !/^(image|video)\/[a-z0-9.+-]{1,64}$/i.test(mimeType) ||
+        !Number.isSafeInteger(size) ||
+        size < 1 ||
+        size > MAX_ATTACHMENT_BYTES
+      ) {
+        webSocket.send(JSON.stringify({ type: "error", error: "Не удалось отправить вложение. Проверьте файл и подключение." }));
+        return;
+      }
+
+      const message = {
+        id: attachment.id,
+        fromId: user.id,
+        toId: recipient.id,
+        type: "attachment",
+        text: "",
+        attachment: { name, mimeType, size },
+        reactions: {},
+        createdAt: new Date().toISOString()
+      };
+      database.messages.push(message);
+      saveDatabase();
+      sendToUser(user.id, { type: "attachment", message });
+      sendToUser(recipient.id, { type: "attachment", message });
+      sendPushToUser(recipient.id, {
+        title: `Вложение от ${user.name}`,
+        body: message.attachment.name,
+        contactId: user.id,
+        tag: `burunduk-chat-${user.id}`
+      });
+      return;
+    }
+
+    if (payload.type === "reaction") {
+      const recipient = findUser(payload.toId);
+      const message = database.messages.find((item) => item.id === payload.messageId);
+      if (
+        !recipient ||
+        !isContact(user, recipient.id) ||
+        !message ||
+        !belongsToConversation(message, user.id, recipient.id) ||
+        !MESSAGE_REACTIONS.has(payload.emoji)
+      ) {
+        webSocket.send(JSON.stringify({ type: "error", error: "Не удалось изменить реакцию." }));
+        return;
+      }
+      if (!message.reactions || typeof message.reactions !== "object" || Array.isArray(message.reactions)) {
+        message.reactions = {};
+      }
+      const users = Array.isArray(message.reactions[payload.emoji]) ? message.reactions[payload.emoji] : [];
+      const userIndex = users.indexOf(user.id);
+      if (userIndex >= 0) users.splice(userIndex, 1);
+      else users.push(user.id);
+      if (users.length > 0) message.reactions[payload.emoji] = users;
+      else delete message.reactions[payload.emoji];
+      saveDatabase();
+      const update = {
+        type: "reaction",
+        messageId: message.id,
+        toId: recipient.id,
+        reactions: message.reactions
+      };
+      sendToUser(user.id, update);
+      sendToUser(recipient.id, update);
       return;
     }
 
     if (payload.type === "typing") {
       if (isContact(user, payload.toId)) sendToUser(payload.toId, { type: "typing", fromId: user.id, active: Boolean(payload.active) });
+      return;
+    }
+
+    if (payload.type === "file-signal") {
+      const target = findUser(payload.toId);
+      const signal = payload.signal;
+      const validKind = signal && ["request", "offer", "answer", "candidate"].includes(signal.kind);
+      if (!target || !isContact(user, target.id) || !validKind) {
+        webSocket.send(JSON.stringify({ type: "error", error: "Сигнал передачи файла не прошёл проверку." }));
+        return;
+      }
+      sendToUser(target.id, { type: "file-signal", from: publicUser(user), signal });
       return;
     }
 

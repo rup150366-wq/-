@@ -16,7 +16,7 @@ self.addEventListener("push", (event) => {
 
   event.waitUntil((async () => {
     const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    if (payload.type !== "call" && clients.some((client) => client.visibilityState === "visible")) return;
+    if (clients.some((client) => client.visibilityState === "visible")) return;
     await self.registration.showNotification(payload.title || "Бурундук", {
       body: payload.body || "Новое сообщение",
       icon: "/icon-192.png",
@@ -24,6 +24,7 @@ self.addEventListener("push", (event) => {
       tag: payload.tag || `burunduk-${payload.contactId || "message"}`,
       renotify: true,
       vibrate: [120, 60, 120],
+      requireInteraction: payload.type === "call",
       data: {
         contactId: payload.contactId || null,
         type: payload.type || "message",
